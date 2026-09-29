@@ -1,0 +1,33 @@
+# SerBot II 웹 대시보드 노드 파라미터
+# 코드에 값을 하드코딩하지 않고 이 파일에서만 설정한다.
+web_dashboard_node:
+  ros__parameters:
+    # HTTP 바인딩 주소/포트
+    host: "0.0.0.0"
+    port: 8000
+    # 구독 토픽 (카메라는 serbot_camera 노드가 발행하는 것을 그대로 받는다)
+    image_topic: "/camera/image_raw_fast"
+    odom_topic: "/odometry/filtered"
+    # MJPEG 스트리밍 해상도. 데이터 수집(collect_gotoobject.py)이 저장하는
+    # 원본 해상도(카메라 네이티브, camera.yaml 의 width/height)와 동일하게
+    # 맞춘다 — 화면에 보이는 그대로가 실제로 저장되는 프레임이어야 격자/정렬
+    # 확인이 의미가 있다. 대역폭이 걱정되면 stream_fps 를 낮출 것.
+    stream_width: 1280
+    stream_height: 720
+    stream_fps: 10
+    jpeg_quality: 70
+    # 이 시간 안에 데이터가 없으면 연결 끊김으로 판정 (초)
+    camera_timeout_sec: 1.0
+    odom_timeout_sec: 1.0
+
+    # 추론(ticvla_bridge.py) 시작/정지 버튼이 띄우는 subprocess 설정.
+    # camera_topic 은 위 image_topic 과 항상 같아야 한다 — 추론이 카메라를
+    # 직접 열면 serbot_camera(camera_node)와 nvarguscamerasrc 를 다퉈 둘 다
+    # 실패한다(web_dashboard_node.py 의 start_inference() 참고).
+    inference_python: "/home/soda/TIC-VLA/venvs/ticvla/bin/python3"
+    inference_script: "/home/soda/TIC-VLA/scripts/ticvla_bridge.py"
+    inference_gpu_lock: "shared"
+    inference_vlm_period: 30.0
+    inference_log_dir: "/home/soda/TIC-VLA/logs"
+    # 공백으로 구분해 추가로 넘길 인자. 예: "--speed-scale 0.5 --max-speed 0.15"
+    inference_extra_args: ""

@@ -1,0 +1,22 @@
+# SerBot II IMX219 CSI 카메라 노드 파라미터
+# 이 파일이 카메라 설정의 유일한 출처이며, 코드에는 값을 하드코딩하지 않는다.
+camera_node:
+  ros__parameters:
+    # nvarguscamerasrc 센서 인덱스 (SerBot II 는 0번 한 대만 장착)
+    sensor_id: 0
+    # 캡처 해상도 (0 보다 커야 함)
+    width: 1280
+    height: 720
+    # 프레임레이트 (1~60 범위, 실측 안정 구간은 15)
+    framerate: 15
+    # nvvidconv flip-method (0=회전 없음)
+    flip_method: 2
+    # 발행 토픽 이름
+    image_topic: "/camera/image_raw_fast"
+    info_topic: "/camera/camera_info"
+    # Image/CameraInfo header 의 frame_id
+    frame_id: "camera_link"
+    # 통계 로그 출력 주기 (초)
+    stats_period_sec: 5.0
+    # 재연결 시도 전 대기 시간 (초)
+    reopen_delay_sec: 2.0

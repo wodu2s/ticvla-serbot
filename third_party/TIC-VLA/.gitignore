@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Data and generated outputs
+datasets/
+outputs/
+output/
+logs/
+wandb/
+lightning_logs/
+benchmark_results/
+DynaNav/benchmark_results/
+DynaNav/logs/
+DynaNav/tmp/
+DynaNav/configs/tmp/
+DynaNav/output/
+DynaNav/outputs/
+
+# Omniverse collect metadata (contains machine-specific source paths)
+**/.collect.mapping.json
+
+# Checkpoints and model weights
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+.pretrained_checkpoints/
+
+# Isaac Sim generated files
+*.dmp
+*.tmp
+.thumbs/
+_isaac_sim*/
+_build/
+_repo/

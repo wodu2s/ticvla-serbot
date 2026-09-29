@@ -1,0 +1,27 @@
+# TIC-VLA stage 1: VLM CoT fine-tuning.
+# Override paths with environment variables or edit this file for your local setup.
+
+train_data_dir:
+  - "${TICVLA_DATA_ROOT}/DynaNav/DynaNav_json"
+  - "${TICVLA_DATA_ROOT}/GND/GND_json"
+  - "${TICVLA_DATA_ROOT}/SCAND/SCAND_json"
+val_data_dir: null
+test_data_dir: null
+
+batch_size: 4
+num_workers: 2
+max_sequence_length: 90
+
+model_path: "${TICVLA_BASE_MODEL_PATH}"
+learning_rate: 3.0e-5
+weight_decay: 1.0e-3
+max_epochs: 10
+warmup_steps: 1000
+precision: "bf16-mixed"
+gradient_clip_val: 1.0
+accumulate_grad_batches: 4
+
+project_name: "tic-vla"
+experiment_name: "vlm_training"
+save_dir: "${TICVLA_OUTPUT_DIR}/checkpoints/ticvla"
+log_dir: "${TICVLA_OUTPUT_DIR}/logs"

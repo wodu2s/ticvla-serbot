@@ -1,0 +1,31 @@
+# TIC-VLA stage 2: action-head training.
+# This stage freezes the VLM loaded from vlm_checkpoint.
+
+train_data_dir:
+  - "${TICVLA_DATA_ROOT}/DynaNav/DynaNav_json"
+  - "${TICVLA_DATA_ROOT}/GND/GND_json"
+  - "${TICVLA_DATA_ROOT}/SCAND/SCAND_json"
+val_data_dir: null
+test_data_dir: null
+
+batch_size: 64
+num_workers: 8
+max_sequence_length: 90
+action_horizon_steps: 30
+action_num_layers: 3
+
+model_path: "${TICVLA_BASE_MODEL_PATH}"
+vlm_checkpoint: "${TICVLA_OUTPUT_DIR}/checkpoints/ticvla/vlm/last.ckpt"
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-3
+max_epochs: 10
+warmup_steps: 1000
+precision: "bf16-mixed"
+gradient_clip_val: 1.0
+accumulate_grad_batches: 1
+
+project_name: "tic-vla"
+experiment_name: "action_training"
+save_dir: "${TICVLA_OUTPUT_DIR}/checkpoints/ticvla"
+log_dir: "${TICVLA_OUTPUT_DIR}/logs"

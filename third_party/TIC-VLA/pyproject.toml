@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticvla"
+version = "0.1.0"
+description = "TIC-VLA: Think-in-Control Vision-Language-Action model for robot navigation"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["ticvla*", "rl*"]
+
+[tool.setuptools.package-data]
+"rl.env.agent" = ["*.yaml"]

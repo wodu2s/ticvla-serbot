@@ -1,0 +1,42 @@
+# 로컬 환경 / 가중치 / 수집 데이터 — 루트만 제외 (패키지 안 data/, models/ 는 유지)
+/venvs/
+/models/
+/checkpoints/
+/data/
+/logs/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ROS 2 빌드 산출물
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# 업스트림 클론의 Isaac 에셋·데모 영상 (수 GB). 소스만 벤더한다.
+third_party/TIC-VLA/.git/
+third_party/TIC-VLA/DynaNav/
+third_party/TIC-VLA/rl/
+third_party/TIC-VLA/docs/img/
+third_party/TIC-VLA/**/.collect.mapping.json
+
+# 에디터 / 백업
+.DS_Store
+.idea/
+.vscode/
+*.bak
+*.tmp
+
+# Hugging Face 캐시
+**/.hf_cache/
+**/.cache/

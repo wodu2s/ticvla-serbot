@@ -1,0 +1,12 @@
+# Single conda environment for supervised TIC-VLA training and optional IsaacLab RL.
+# DynaNav dependencies are installed into Isaac Sim Python instead.
+name: tic-vla
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements-train.txt

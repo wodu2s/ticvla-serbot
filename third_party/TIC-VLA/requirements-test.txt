@@ -1,0 +1,14 @@
+# Extra Python dependencies for DynaNav and Isaac Sim workflows.
+# Install with: "${ISAAC_SIM_PYTHON}" -m pip install -r requirements-test.txt
+# Isaac Sim 5.0 ships binary modules compiled against the NumPy 1.x ABI.
+# Keep NumPy below 2 and do not install requirements-train.txt here, because it
+# can replace Isaac's CUDA/PyTorch stack.
+numpy>=1.26,<2.0
+transformers>=4.40.0,<5.0.0
+huggingface-hub>=0.34.0,<1.0
+accelerate>=0.20.0
+einops>=0.7.0
+timm>=0.9.12
+opencv-python>=4.8.0
+matplotlib>=3.7.0
+PyYAML>=6.0
