@@ -1,0 +1,6 @@
+bool success
+float64 final_distance
+string notes
+---
+bool accepted
+string reason

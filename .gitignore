@@ -27,7 +27,7 @@ ros2_ws/log/
 third_party/TIC-VLA/.git/
 third_party/TIC-VLA/DynaNav/
 third_party/TIC-VLA/rl/
-third_party/TIC-VLA/docs/img/
+third_party/TIC-VLA/docs/
 third_party/TIC-VLA/**/.collect.mapping.json
 
 # 에디터 / 백업
@@ -40,3 +40,11 @@ third_party/TIC-VLA/**/.collect.mapping.json
 # Hugging Face 캐시
 **/.hf_cache/
 **/.cache/
+data/
+third_party/
+checkpoints/
+models/
+logs/
+*.tar.gz
+*.ckpt
+*.pt

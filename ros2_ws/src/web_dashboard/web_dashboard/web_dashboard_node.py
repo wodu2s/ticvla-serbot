@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import shlex
 import signal
@@ -28,6 +29,7 @@ import cv2
 import numpy as np
 import rclpy
 import uvicorn
+from collect_interfaces.srv import SetConfig, SubmitResult
 from cv_bridge import CvBridge
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -63,6 +65,19 @@ INFERENCE_POLL_PERIOD_SEC: float = 2.0
 #: /ticvla/status 발행자가 아직 없을 때 표시할 문자열.
 STATUS_NOT_AVAILABLE: str = 'N/A'
 
+#: joystick_colormarker.py 와 공유하는 토픽/서비스 이름.
+COLLECT_STATUS_TOPIC: str = '/collect/status'
+COLLECT_SET_CONFIG_SRV: str = '/collect/set_config'
+COLLECT_SUBMIT_RESULT_SRV: str = '/collect/submit_result'
+
+#: /collect/status 가 이보다 오래 안 왔으면 "수집기 미실행"으로 본다.
+COLLECT_STATUS_STALE_SEC: float = 3.0
+#: 서비스가 아직 떠 있지 않을 때 기다리는 시간(초). 대시보드 요청을 오래
+#: 붙잡지 않도록 짧게 잡는다 — 이 시간 안에 없으면 "수집기 미실행"으로 답한다.
+COLLECT_SERVICE_DISCOVER_SEC: float = 1.0
+#: 서비스 호출 자체(수집기가 응답하기까지)의 타임아웃(초).
+COLLECT_SERVICE_CALL_TIMEOUT_SEC: float = 5.0
+
 
 # ======================================================================
 # 요청 본문 모델
@@ -71,6 +86,21 @@ class InstructionRequest(BaseModel):
     """POST /api/instruction 의 요청 본문."""
 
     text: str = Field(default='', description='TIC-VLA 에 전달할 자연어 지시문')
+
+
+class CollectSetConfigRequest(BaseModel):
+    """POST /api/collect/set_config 의 요청 본문."""
+
+    layout: int = Field(description='마커 배치 1|2|3')
+    target_color: str = Field(description='목표색 red|green|blue')
+
+
+class CollectSubmitResultRequest(BaseModel):
+    """POST /api/collect/submit_result 의 요청 본문."""
+
+    success: bool = Field(description='마커 앞에서 성공적으로 정지했는가')
+    final_distance: float = Field(default=0.0, description='최종 거리(m)')
+    notes: str = Field(default='', description='비고(선택)')
 
 
 # ======================================================================
@@ -164,6 +194,11 @@ class WebDashboardNode(Node):
         self._enabled: bool = False
         self._estop: bool = False
 
+        # /collect/status 스냅샷 (joystick_colormarker.py 가 2Hz 로 발행하는
+        # JSON). 파싱 실패나 미수신은 collect_snapshot() 에서 처리한다.
+        self._collect_status: Optional[dict[str, Any]] = None
+        self._collect_status_at: Optional[float] = None
+
         self._node_count: int = 0
         self._start_time: float = time.monotonic()
 
@@ -219,6 +254,19 @@ class WebDashboardNode(Node):
             Odometry, self._odom_topic, self._on_odom, sensor_qos)
         self.create_subscription(
             String, '/ticvla/status', self._on_ticvla_status, command_qos)
+        self.create_subscription(
+            String, COLLECT_STATUS_TOPIC, self._on_collect_status, command_qos)
+
+        # ── 데이터 수집 서비스 클라이언트 (joystick_colormarker.py 가 서버) ──
+        # 이 노드는 지금까지 명령을 토픽 발행(fire-and-forget)으로만 다뤘다.
+        # 배치/목표색 설정과 결과 제출은 수락/거부 사유가 바로 필요해 서비스로
+        # 부른다 — rclpy 가 이미 별도 스레드에서 spin 중이라 동기 Client.call()
+        # 은 못 쓰고, call_async()+콜백+Event 로 블로킹 대기한다
+        # (_call_collect_service 참고).
+        self._collect_set_config_cli = self.create_client(
+            SetConfig, COLLECT_SET_CONFIG_SRV)
+        self._collect_submit_result_cli = self.create_client(
+            SubmitResult, COLLECT_SUBMIT_RESULT_SRV)
 
         # ── 발행 ──
         self._enable_pub = self.create_publisher(
@@ -367,6 +415,21 @@ class WebDashboardNode(Node):
         """
         with self._lock:
             self._ticvla_status = msg.data
+
+    def _on_collect_status(self, msg: String) -> None:
+        """joystick_colormarker.py 가 보내는 /collect/status(JSON)를 저장한다.
+
+        Args:
+            msg: 구독한 std_msgs/String (JSON 페이로드).
+        """
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            self.get_logger().warn(f'/collect/status JSON 파싱 실패: {exc}')
+            return
+        with self._lock:
+            self._collect_status = payload
+            self._collect_status_at = time.monotonic()
 
     def _publish_heartbeat(self) -> None:
         """0.5초마다 생존 신호를 발행한다.
@@ -607,6 +670,103 @@ class WebDashboardNode(Node):
         return {'running': running, 'pid': pid, 'last_notice': notice}
 
     # ------------------------------------------------------------------
+    # 데이터 수집 (joystick_colormarker.py) 연동
+    # ------------------------------------------------------------------
+    def collect_snapshot(self) -> dict[str, Any]:
+        """/api/status 에 실어 보낼 /collect/status 스냅샷.
+
+        Returns:
+            수집기가 안 떠 있거나(한 번도 수신 안 함) 상태가 오래됐으면
+            `{"available": False}` 만 담은 딕셔너리, 아니면 마지막으로 받은
+            필드 전체에 `available: True` 를 더한 딕셔너리.
+        """
+        with self._lock:
+            payload = self._collect_status
+            at = self._collect_status_at
+        age = (time.monotonic() - at) if at is not None else float('inf')
+        if payload is None or age > COLLECT_STATUS_STALE_SEC:
+            return {'available': False}
+        return {**payload, 'available': True}
+
+    def _call_collect_service(self, client: Any, request: Any) -> tuple[bool, str, Any]:
+        """수집기 서비스를 블로킹으로 호출한다 (없으면 즉시 실패로 답한다).
+
+        rclpy 실행기는 `_spin_ros` 데몬 스레드에서 이미 spin 중이라, 이 HTTP
+        요청 스레드에서 동기 `Client.call()` 을 쓰면 같은 노드를 두 스레드가
+        spin 하려는 셈이 돼 안전하지 않다. 대신 `call_async()` 로 얻은
+        future 에 완료 콜백을 걸어 `threading.Event` 를 set 하게 하고, 이
+        스레드는 그 Event 를 기다린다 — 콜백은 executor 스레드가 실행하므로
+        안전하다.
+
+        Args:
+            client: 호출할 서비스 클라이언트.
+            request: 채워진 요청 메시지.
+
+        Returns:
+            (수락 여부, 사람이 읽을 메시지, 원본 응답 또는 None).
+        """
+        if not client.service_is_ready():
+            if not client.wait_for_service(timeout_sec=COLLECT_SERVICE_DISCOVER_SEC):
+                return False, '수집기 미실행 — joystick_colormarker.py 가 떠 있는지 확인할 것', None
+
+        done = threading.Event()
+        result_holder: list[Any] = []
+
+        def _on_done(fut: Any) -> None:
+            result_holder.append(fut)
+            done.set()
+
+        future = client.call_async(request)
+        future.add_done_callback(_on_done)
+        if not done.wait(timeout=COLLECT_SERVICE_CALL_TIMEOUT_SEC):
+            return False, '수집기 응답 시간 초과', None
+
+        fut = result_holder[0]
+        exc = fut.exception()
+        if exc is not None:
+            return False, f'서비스 호출 실패: {exc!r}', None
+        response = fut.result()
+        return bool(response.accepted), str(response.reason), response
+
+    def call_set_config(self, layout: int, target_color: str) -> dict[str, Any]:
+        """/collect/set_config 를 호출한다.
+
+        Args:
+            layout: 마커 배치 1|2|3.
+            target_color: 목표색 red|green|blue.
+
+        Returns:
+            {ok, message, target_side}.
+        """
+        request = SetConfig.Request(layout=int(layout), target_color=str(target_color))
+        ok, reason, response = self._call_collect_service(
+            self._collect_set_config_cli, request)
+        return {
+            'ok': ok,
+            'message': reason or ('수락됨' if ok else '거부됨'),
+            'target_side': (response.target_side if response is not None else ''),
+        }
+
+    def call_submit_result(self, success: bool, final_distance: float,
+                           notes: str) -> dict[str, Any]:
+        """/collect/submit_result 를 호출한다.
+
+        Args:
+            success: 성공 여부.
+            final_distance: 최종 거리(m).
+            notes: 비고.
+
+        Returns:
+            {ok, message}.
+        """
+        request = SubmitResult.Request(
+            success=bool(success), final_distance=float(final_distance),
+            notes=str(notes))
+        ok, reason, _response = self._call_collect_service(
+            self._collect_submit_result_cli, request)
+        return {'ok': ok, 'message': reason or ('수락됨' if ok else '거부됨')}
+
+    # ------------------------------------------------------------------
     # HTTP 계층에서 읽어가는 상태
     # ------------------------------------------------------------------
     def get_stream_jpeg(self) -> bytes:
@@ -689,6 +849,7 @@ class WebDashboardNode(Node):
                 'estop': estop,
             },
             'inference': self.inference_snapshot(),
+            'collect': self.collect_snapshot(),
             'system': {
                 'uptime_sec': round(now - self._start_time, 1),
             },
@@ -808,6 +969,27 @@ def create_app(node: WebDashboardNode) -> FastAPI:
         return JSONResponse(content={'ok': ok, 'message': message},
                             status_code=200 if ok else 409)
 
+    @app.get('/collect', response_class=HTMLResponse)
+    async def collect_page() -> HTMLResponse:
+        """데이터 수집 페이지를 반환한다."""
+        return HTMLResponse(content=COLLECT_HTML)
+
+    # 아래 두 엔드포인트만 async def 가 아니라 def 다 — 서비스 응답을
+    # 기다리는 동안(최대 COLLECT_SERVICE_CALL_TIMEOUT_SEC) 블로킹하므로,
+    # FastAPI 가 스레드풀에서 돌려 uvicorn 의 이벤트 루프를 막지 않게 한다.
+    @app.post('/api/collect/set_config')
+    def api_collect_set_config(payload: CollectSetConfigRequest) -> JSONResponse:
+        """배치/목표색을 수집기에 설정 요청한다."""
+        result = node.call_set_config(payload.layout, payload.target_color)
+        return JSONResponse(content=result, status_code=200 if result['ok'] else 409)
+
+    @app.post('/api/collect/submit_result')
+    def api_collect_submit_result(payload: CollectSubmitResultRequest) -> JSONResponse:
+        """에피소드 결과(성공/실패/거리/비고)를 수집기에 제출한다."""
+        result = node.call_submit_result(
+            payload.success, payload.final_distance, payload.notes)
+        return JSONResponse(content=result, status_code=200 if result['ok'] else 409)
+
     return app
 
 
@@ -860,6 +1042,11 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   }
   body.estop { border: 8px solid #e02020; }
   h1 { font-size: 20px; margin: 0 0 12px 0; letter-spacing: 0.5px; }
+  .nav-link {
+    font-size: 13px; font-weight: 400; margin-left: 14px;
+    color: #60a5fa; text-decoration: none;
+  }
+  .nav-link:hover { text-decoration: underline; }
   .layout { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
   .video-box { flex: 1 1 640px; min-width: 320px; }
   .video-frame { position: relative; }
@@ -944,7 +1131,9 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>SerBot II &mdash; TIC-VLA Dashboard</h1>
+<h1>SerBot II &mdash; TIC-VLA Dashboard
+  <a class="nav-link" href="/collect">데이터 수집 →</a>
+</h1>
 <div class="estop-banner">EMERGENCY STOP ENGAGED</div>
 
 <div class="layout">
@@ -1210,6 +1399,357 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+"""
+
+
+# ======================================================================
+# 데이터 수집 페이지 (joystick_colormarker.py 연동)
+# ======================================================================
+COLLECT_HTML: str = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SerBot II Collect</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    background: #12141a; color: #e8eaf0;
+    font-family: "DejaVu Sans", "Noto Sans CJK KR", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 12px 0; letter-spacing: 0.5px; }
+  .nav-link {
+    font-size: 13px; font-weight: 400; margin-left: 14px;
+    color: #60a5fa; text-decoration: none;
+  }
+  .nav-link:hover { text-decoration: underline; }
+  .down-banner {
+    display: none; background: #dc2626; color: #fff; font-weight: 700;
+    padding: 10px; border-radius: 5px; margin-bottom: 12px; text-align: center;
+    letter-spacing: 1px;
+  }
+  body.down .down-banner { display: block; }
+  .layout { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .video-box { flex: 2 1 640px; min-width: 320px; }
+  .video-box img {
+    width: 100%; background: #000; border: 1px solid #2a2f3a; border-radius: 6px;
+    display: block;
+  }
+  .hint { font-size: 12px; color: #6b7280; line-height: 1.5; margin-top: 8px; }
+  .panel {
+    flex: 1 1 380px; min-width: 320px;
+    background: #1a1d26; border: 1px solid #2a2f3a; border-radius: 6px; padding: 14px;
+  }
+  .panel h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 1px;
+    color: #8b93a7; margin: 0 0 8px 0;
+  }
+  .section { margin-bottom: 16px; }
+  .row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 3px 0; font-size: 14px;
+  }
+  .row .label { color: #9aa3b8; }
+  .row .value { font-family: "DejaVu Sans Mono", monospace; }
+  .dot {
+    display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle; background: #555;
+  }
+  .dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .dot.off { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  .dot.big { width: 16px; height: 16px; }
+  .btn-row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  button {
+    font-family: inherit; font-size: 14px; font-weight: 600;
+    border: none; border-radius: 5px; padding: 10px 14px; cursor: pointer;
+    color: #fff; background: #2a2f3a; flex: 1; min-width: 90px;
+  }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  button.active { background: #2563eb; }
+  button.color-red.active { background: #b91c1c; }
+  button.color-green.active { background: #15803d; }
+  button.color-blue.active { background: #1d4ed8; }
+  .btn-success { background: #16a34a; }
+  .btn-fail { background: #b91c1c; }
+  .color-hint { font-size: 11px; color: #8b93a7; display: block; margin-top: 2px; }
+  table.counts { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.counts th, table.counts td {
+    border: 1px solid #2a2f3a; padding: 5px 8px; text-align: center;
+  }
+  table.counts th { color: #8b93a7; font-weight: 600; }
+  table.counts td.current { background: #1e3a8a; font-weight: 700; }
+  .total-row { margin-top: 6px; font-size: 13px; color: #9aa3b8; }
+  .result-form { display: none; }
+  .result-form.enabled { display: block; }
+  .result-form input[type=text], .result-form input[type=number] {
+    width: 100%; padding: 8px; margin-top: 4px; margin-bottom: 10px;
+    background: #0e1015; color: #e8eaf0; border: 1px solid #2a2f3a;
+    border-radius: 5px; font-family: inherit; font-size: 14px;
+  }
+  .result-form label { font-size: 13px; color: #9aa3b8; }
+  .state-pill {
+    display: inline-block; padding: 3px 10px; border-radius: 10px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
+  }
+  .state-pill.idle { background: #374151; }
+  .state-pill.recording { background: #b45309; }
+  .state-pill.awaiting_result { background: #7c3aed; }
+</style>
+</head>
+<body>
+<h1>SerBot II &mdash; 데이터 수집
+  <a class="nav-link" href="/">← 실시간 대시보드</a>
+</h1>
+<div class="down-banner">수집기 미실행 — joystick_colormarker.py 가 떠 있는지 확인할 것
+  (colrec 로 실행했는지, /collect/status 가 오는지)</div>
+
+<div class="layout">
+  <!-- 1) 카메라 라이브 뷰 — 3색이 다 보이는지 시작 전에 반드시 확인 -->
+  <div class="video-box">
+    <img src="/video_feed" alt="camera stream">
+    <div class="hint">
+      시작 전에 화면에 3색 마커가 전부 보이는지 확인할 것 — 한 색만 보이는
+      장면에서 찍으면 색을 무시해도 정답이 나와 그 에피소드가 무의미해진다.
+    </div>
+  </div>
+
+  <div class="panel">
+    <!-- 5) 상태 표시 -->
+    <div class="section">
+      <h2>상태</h2>
+      <div class="row">
+        <span class="label">state</span>
+        <span class="value"><span id="state-pill" class="state-pill idle">-</span></span>
+      </div>
+      <div class="row">
+        <span class="label">odom</span>
+        <span class="value">
+          <span id="odom-dot" class="dot big"></span><span id="odom-text">-</span>
+        </span>
+      </div>
+      <div class="row">
+        <span class="label">frame_hz</span><span class="value" id="frame-hz">-</span>
+      </div>
+      <div class="row">
+        <span class="label">직전 폴더</span><span class="value" id="last-episode">-</span>
+      </div>
+    </div>
+
+    <!-- 2) 배치 선택 -->
+    <div class="section">
+      <h2>배치 선택</h2>
+      <div class="btn-row">
+        <button id="layout-btn-1" onclick="selectLayout(1)">배치 1</button>
+        <button id="layout-btn-2" onclick="selectLayout(2)">배치 2</button>
+        <button id="layout-btn-3" onclick="selectLayout(3)">배치 3</button>
+      </div>
+      <div class="hint" id="layout-current">현재 배치: -</div>
+    </div>
+
+    <!-- 3) 목표색 선택 -->
+    <div class="section">
+      <h2>목표색 선택</h2>
+      <div class="btn-row">
+        <button id="color-btn-red" class="color-red" onclick="selectColor('red')">
+          red<span class="color-hint" id="slot-red">-</span>
+        </button>
+        <button id="color-btn-green" class="color-green" onclick="selectColor('green')">
+          green<span class="color-hint" id="slot-green">-</span>
+        </button>
+        <button id="color-btn-blue" class="color-blue" onclick="selectColor('blue')">
+          blue<span class="color-hint" id="slot-blue">-</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 4) 누적 카운터 -->
+    <div class="section">
+      <h2>누적 카운터</h2>
+      <table class="counts" id="counts-table">
+        <thead>
+          <tr><th>배치</th><th>red</th><th>green</th><th>blue</th></tr>
+        </thead>
+        <tbody id="counts-body"></tbody>
+      </table>
+      <div class="total-row" id="counts-total">합계 -/72</div>
+    </div>
+
+    <!-- 6) 결과 입력 폼 (awaiting_result 일 때만 활성) -->
+    <div class="section">
+      <h2>결과 입력</h2>
+      <div id="result-form" class="result-form">
+        <label>최종 거리(m)</label>
+        <input type="number" step="0.01" id="final-distance" value="0.80">
+        <label>비고(선택)</label>
+        <input type="text" id="notes" placeholder="">
+        <div class="btn-row">
+          <button class="btn-success" onclick="submitResult(true)">성공</button>
+          <button class="btn-fail" onclick="submitResult(false)">실패</button>
+        </div>
+      </div>
+      <div class="hint" id="result-hint">
+        결과 대기 상태(awaiting_result)가 아니면 비활성화된다. 제출해야 다음
+        에피소드로 넘어간다.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const LAYOUT_SIDE_COLOR = {
+  1: {left: 'blue', center: 'red', right: 'green'},
+  2: {left: 'red', center: 'green', right: 'blue'},
+  3: {left: 'green', center: 'blue', right: 'red'},
+};
+const COLOR_KO = {red: '빨강', green: '초록', blue: '파랑'};
+const SIDE_KO = {left: '좌', center: '중', right: '우'};
+
+let uiLayout = null;
+let uiColor = null;
+let lastState = 'idle';
+
+function sideOf(layout, color) {
+  const sides = LAYOUT_SIDE_COLOR[layout];
+  for (const side in sides) { if (sides[side] === color) { return side; } }
+  return null;
+}
+
+function layoutDesc(n) {
+  const s = LAYOUT_SIDE_COLOR[n];
+  return `좌=${COLOR_KO[s.left]} 중=${COLOR_KO[s.center]} 우=${COLOR_KO[s.right]}`;
+}
+
+async function collectPostJson(url, body) {
+  let data = {ok: false, message: '요청 실패'};
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+    data = await res.json().catch(() => ({ok: false, message: 'HTTP ' + res.status}));
+    if (!data.ok) { alert(data.message || ('요청 실패: HTTP ' + res.status)); }
+  } catch (e) {
+    alert('요청 실패: ' + e);
+  }
+  refreshCollect();
+  return data;
+}
+
+async function selectLayout(n) {
+  if (lastState !== 'idle') {
+    alert('녹화/결과대기 중에는 배치를 바꿀 수 없다 (state=' + lastState + ')');
+    return;
+  }
+  if (!confirm('마커를 배치 ' + n + ' 대로 놓았습니까?\\n' + layoutDesc(n))) { return; }
+  const color = uiColor || 'red';
+  const res = await collectPostJson('/api/collect/set_config', {layout: n, target_color: color});
+  if (res.ok) { uiLayout = n; uiColor = color; }
+}
+
+async function selectColor(c) {
+  if (lastState !== 'idle') {
+    alert('녹화/결과대기 중에는 목표색을 바꿀 수 없다 (state=' + lastState + ')');
+    return;
+  }
+  if (uiLayout == null) { alert('배치를 먼저 선택하세요'); return; }
+  const res = await collectPostJson('/api/collect/set_config', {layout: uiLayout, target_color: c});
+  if (res.ok) { uiColor = c; }
+}
+
+async function submitResult(success) {
+  const distEl = document.getElementById('final-distance');
+  const notesEl = document.getElementById('notes');
+  const dist = parseFloat(distEl.value);
+  await collectPostJson('/api/collect/submit_result', {
+    success: success,
+    final_distance: isNaN(dist) ? 0.0 : dist,
+    notes: notesEl.value,
+  });
+  notesEl.value = '';
+}
+
+function renderCounts(counts, layout) {
+  const body = document.getElementById('counts-body');
+  body.innerHTML = '';
+  let total = 0;
+  for (const l of [1, 2, 3]) {
+    const row = (counts && counts[String(l)]) || {red: 0, green: 0, blue: 0};
+    const tr = document.createElement('tr');
+    const cur = (layout === l);
+    tr.innerHTML =
+      '<td>' + l + (cur ? ' ★' : '') + '</td>' +
+      ['red', 'green', 'blue'].map(c =>
+        '<td' + (cur ? ' class="current"' : '') + '>' + (row[c] || 0) + '/8</td>'
+      ).join('');
+    body.appendChild(tr);
+    total += (row.red || 0) + (row.green || 0) + (row.blue || 0);
+  }
+  document.getElementById('counts-total').textContent = '합계 ' + total + '/72';
+}
+
+async function refreshCollect() {
+  let s;
+  try {
+    const res = await fetch('/api/status', {cache: 'no-store'});
+    s = (await res.json()).collect;
+  } catch (e) {
+    document.body.classList.add('down');
+    return;
+  }
+  if (!s || !s.available) {
+    document.body.classList.add('down');
+    return;
+  }
+  document.body.classList.remove('down');
+
+  lastState = s.state || 'idle';
+  const pill = document.getElementById('state-pill');
+  pill.textContent = lastState;
+  pill.className = 'state-pill ' + lastState;
+
+  setDotBig('odom-dot', !!s.odom_ok);
+  document.getElementById('odom-text').textContent = s.odom_ok ? 'OK' : '미수신';
+  document.getElementById('frame-hz').textContent =
+    (typeof s.frame_hz === 'number' ? s.frame_hz.toFixed(1) : '-');
+  document.getElementById('last-episode').textContent = s.last_episode_dir || '-';
+
+  uiLayout = s.layout;
+  uiColor = s.target_color;
+  document.getElementById('layout-current').textContent =
+    'current 배치: ' + (s.layout != null ? s.layout + ' (' + layoutDesc(s.layout) + ')' : '미설정');
+
+  for (const n of [1, 2, 3]) {
+    const btn = document.getElementById('layout-btn-' + n);
+    btn.classList.toggle('active', s.layout === n);
+    btn.disabled = (lastState !== 'idle');
+  }
+  for (const c of ['red', 'green', 'blue']) {
+    const btn = document.getElementById('color-btn-' + c);
+    btn.classList.toggle('active', s.target_color === c);
+    btn.disabled = (lastState !== 'idle') || (s.layout == null);
+    const slot = document.getElementById('slot-' + c);
+    const side = (s.layout != null) ? sideOf(s.layout, c) : null;
+    slot.textContent = side ? SIDE_KO[side] : '-';
+  }
+
+  renderCounts(s.counts, s.layout);
+
+  const formEnabled = (lastState === 'awaiting_result');
+  document.getElementById('result-form').classList.toggle('enabled', formEnabled);
+  document.getElementById('result-hint').style.display = formEnabled ? 'none' : 'block';
+}
+
+function setDotBig(id, ok) {
+  document.getElementById(id).className = 'dot big ' + (ok ? 'on' : 'off');
+}
+
+refreshCollect();
+setInterval(refreshCollect, 1000);
 </script>
 </body>
 </html>

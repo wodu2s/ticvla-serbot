@@ -33,14 +33,22 @@ joystick_gotoobject.py 기반 (SerBot 백엔드·데드존·스틱→cmd_vel 변
 에피소드 진행 (사람이 조이스틱으로 직접 조종)
 --------------------------------------------
 접근(0.10 m/s 직행) → 마커 1.5m 부터 서서히 감속(★ 급정지 금지) →
-마커 앞 0.8m 에서 정지 → 즉시 종료(성공/실패·최종거리 수기 입력).
-정지 유지 구간 없음 — 도착 판정은 향후 라이다로 옮길 예정이라 지금은
-운전자가 직접 판단해 9번을 누른다. 감속 램프는 소프트웨어가 강제하지
-않는다(조이스틱 수동 조종이므로) — 운전자가 지켜야 할 규칙이다.
+마커 앞 0.8m 에서 정지 → 즉시 종료(9번). 정지 유지 구간 없음 — 도착 판정은
+향후 라이다로 옮길 예정이라 지금은 운전자가 직접 판단해 9번을 누른다.
+감속 램프는 소프트웨어가 강제하지 않는다(조이스틱 수동 조종이므로) —
+운전자가 지켜야 할 규칙이다.
 
 이 프로세스는 한 번 실행해서 여러 에피소드를 연달아 모은다 — 8=시작,
 9=종료 가 매 에피소드마다 반복된다. joystick_errand.py 처럼 세션 하나
 끝나면 프로세스가 종료되는 구조가 아니다.
+
+조건 선택(배치/목표색)과 결과 입력(성공/실패/최종거리/비고)은 이 스크립트가
+아니라 웹 대시보드(web_dashboard_node, /collect 페이지)가 ROS 서비스
+(/collect/set_config, /collect/submit_result)로 넣는다 — 조이스틱은 주행과
+8/9(시작/종료)만 맡는다. 대시보드가 죽어도 8/9 와 녹화는 항상 동작해야
+하므로, 9번으로 종료해 결과 대기(awaiting_result) 상태가 된 뒤 대시보드가
+없으면 비상 제출 버튼(EMERGENCY_SUBMIT_BUTTON)으로 "성공, 최종거리
+기본값"으로 즉시 확정할 수 있다.
 
 저장 구조
 ---------
@@ -91,7 +99,10 @@ critical object 로 지목됐고, marker 는 파랑에서 2회 모두 장애물�
 
 실행
 ----
-    python3 collect/joystick_colormarker.py --layout 1
+    python3 collect/joystick_colormarker.py
+
+    배치/목표색은 대시보드(/collect)에서 설정한다 — 여기엔 --layout 인자가
+    없다.
 """
 
 from __future__ import annotations
@@ -107,12 +118,14 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import cv2
 import rclpy
+from collect_interfaces.srv import SetConfig, SubmitResult
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -121,6 +134,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image as ImageMsg
+from std_msgs.msg import String
 
 # pygame 은 SDL 드라이버를 결정한 뒤에 import 해야 한다 (원본과 같은 처리).
 if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
@@ -174,6 +188,23 @@ LAYOUT_SIDE_COLOR: dict[int, dict[str, str]] = {
 }
 
 VERIFY_SCRIPT = Path(__file__).resolve().parent / "verify_errand_session.py"
+
+#: 상태 머신. 대시보드가 조회/변경하는 값은 전부 이 세 값 중 하나다.
+STATE_IDLE = "idle"
+STATE_RECORDING = "recording"
+STATE_AWAITING_RESULT = "awaiting_result"
+
+#: 대시보드가 죽었을 때 결과 입력 비상구로 쓰는 버튼. 색 선택 버튼이 없어지며
+#: 비게 된 구 red_button(1) 슬롯을 재사용한다 — 예약 버튼(0,2,3,4,6,7,8,9)과
+#: 겹치지 않는다.
+EMERGENCY_SUBMIT_BUTTON = 1
+
+#: 비상 제출 시 쓰는 최종거리 기본값. "0.8m 에서 정지"라는 수집 절차의 정지
+#: 기준값과 맞춘다 — 실제로 그 근처에서 멈췄을 것이라는 가정.
+EMERGENCY_DEFAULT_DISTANCE = 0.8
+
+#: /collect/status 발행 주기(초). 2Hz.
+STATUS_PERIOD_SEC = 0.5
 
 #: joystick_gotoobject 모듈 핸들. import 시 SerBot 백엔드가 로드되므로
 #: 인자 검증이 끝난 뒤에만 채운다.
@@ -328,9 +359,9 @@ def default_root() -> str:
 
 @dataclass
 class Config:
-    """실행 설정."""
+    """실행 설정. 배치/목표색은 여기 없다 — 대시보드가 서비스로 넣는
+    런타임 상태(ColorMarkerRecorder.layout/target_color)다."""
 
-    layout: int
     root: Path
     target_per_color: int
     hz: float
@@ -338,9 +369,6 @@ class Config:
     odom_topic: str
     camera_topic: str
     cmd_vel_topic: str
-    red_button: int
-    green_button: int
-    blue_button: int
     sensor_timeout: float
     odom_stall_sec: float
     camera_stall_sec: float
@@ -406,6 +434,8 @@ class ColorMarkerRecorder(Node):
         self._image_at = 0.0
         self._saved_image_seq = 0
         self._image_shape: Optional[tuple[int, int]] = None
+        #: 최근 2초간 프레임 수신 시각 — /collect/status 의 frame_hz 계산용.
+        self._image_times: deque[float] = deque()
 
         self._odom: tuple[float, ...] = (0.0,) * 6 + (1.0,)
         self._odom_seq = 0
@@ -414,11 +444,21 @@ class ColorMarkerRecorder(Node):
         # ── 조건 선택 / 에피소드 상태 (state_lock 으로 보호) ──
         self._state_lock = threading.RLock()
         self._commands: list[tuple[float, str, str]] = []
+        #: 대시보드(/collect/set_config)가 설정한다. 에피소드가 끝나도
+        #: 유지된다 — 같은 배치/색을 여러 번(색당 8회) 반복 촬영하는 실제
+        #: 작업 패턴에 맞춘 것이다.
+        self.layout: Optional[int] = None
         self.target_color: Optional[str] = None
+        #: idle / recording / awaiting_result. 대시보드와 콘솔이 그대로
+        #: 읽어가는 값이라 문자열 상수(STATE_*)로 둔다.
+        self.state: str = STATE_IDLE
         self.current: Optional[Episode] = None
         self.last_closed: Optional[Episode] = None
         self.fatal: Optional[str] = None
         self.episode_closed = threading.Event()
+        #: 8번(시작)이 거부됐을 때 사유. (시각, 사유) — /collect/status 와
+        #: 콘솔에 노출한다. 대시보드엔 시작 버튼이 없어 디버그 용도에 가깝다.
+        self._last_start_rejection: Optional[tuple[float, str]] = None
 
         self._cmd_pub = self.create_publisher(Twist, cfg.cmd_vel_topic, 10)
         self.create_subscription(
@@ -427,6 +467,13 @@ class ColorMarkerRecorder(Node):
             Odometry, cfg.odom_topic, self._on_odom, 10)
         self.create_timer(1.0 / cfg.hz, self._on_tick)
 
+        # ── 대시보드 연동: 서비스 서버 + 상태 퍼블리셔 ──
+        self.create_service(SetConfig, "/collect/set_config", self._on_set_config)
+        self.create_service(
+            SubmitResult, "/collect/submit_result", self._on_submit_result)
+        self._status_pub = self.create_publisher(String, "/collect/status", 10)
+        self.create_timer(STATUS_PERIOD_SEC, self._publish_status)
+
     # ── 구독 콜백 ────────────────────────────────────────────────
     def _on_image(self, msg: ImageMsg) -> None:
         """최신 카메라 프레임을 보관한다.
@@ -434,10 +481,14 @@ class ColorMarkerRecorder(Node):
         Args:
             msg: sensor_msgs/Image (bgr8).
         """
+        now = time.monotonic()
         with self._sensor_lock:
             self._image_msg = msg
             self._image_seq += 1
-            self._image_at = time.monotonic()
+            self._image_at = now
+            self._image_times.append(now)
+            while self._image_times and now - self._image_times[0] > 2.0:
+                self._image_times.popleft()
 
     def _on_odom(self, msg: Odometry) -> None:
         """휠 오도메트리를 변환 없이 그대로 보관한다.
@@ -467,6 +518,32 @@ class ColorMarkerRecorder(Node):
         with self._sensor_lock:
             at = self._odom_at
         return at > 0.0 and (time.monotonic() - at) < max_age
+
+    def camera_fresh(self, max_age: float = 1.0) -> bool:
+        """카메라 프레임이 최근에 수신됐는지.
+
+        Args:
+            max_age: 이 시간(초) 안에 수신이 있어야 신선하다고 본다.
+
+        Returns:
+            신선하면 True.
+        """
+        with self._sensor_lock:
+            at = self._image_at
+        return at > 0.0 and (time.monotonic() - at) < max_age
+
+    def frame_hz(self) -> float:
+        """최근 2초간 카메라 프레임 수신 Hz. /collect/status 표시용.
+
+        Returns:
+            Hz. 표본이 2개 미만이면 0.0.
+        """
+        with self._sensor_lock:
+            times = list(self._image_times)
+        if len(times) < 2:
+            return 0.0
+        span = times[-1] - times[0]
+        return (len(times) - 1) / span if span > 0 else 0.0
 
     # ── 메인 스레드에서 호출하는 요청 API ─────────────────────────
     def publish_cmd_vel(self, lx: float, ly: float, az: float) -> None:
@@ -498,17 +575,6 @@ class ColorMarkerRecorder(Node):
         with self._state_lock:
             self._commands.append((time.monotonic(), "stop", status))
 
-    def set_target_color(self, color: str) -> None:
-        """목표색 선택을 바꾼다 (기록 중에는 안 바뀐다).
-
-        Args:
-            color: "red" | "green" | "blue".
-        """
-        with self._state_lock:
-            if self.current is not None:
-                return
-            self.target_color = color
-
     def mark_emergency(self) -> None:
         """긴급 정지 이벤트를 현재 에피소드에 기록한다 (기록은 계속됨)."""
         with self._state_lock:
@@ -533,45 +599,71 @@ class ColorMarkerRecorder(Node):
         })
 
     # ── 에피소드 생명주기 (executor 스레드에서만 실행) ─────────────
+    def _reject_start(self, reason: str) -> None:
+        """8번(시작) 요청을 거부하고 사유를 남긴다.
+
+        Args:
+            reason: 사람이 읽을 거부 사유.
+        """
+        self.log.warn(f"시작 거부: {reason}")
+        with self._state_lock:
+            self._last_start_rejection = (time.monotonic(), reason)
+
     def _cmd_start(self, mono: float) -> None:
-        """조건이 선택돼 있으면 새 에피소드 폴더를 만들고 기록을 시작한다.
+        """조건이 갖춰져 있으면 새 에피소드 폴더를 만들고 기록을 시작한다.
+
+        배치/목표색은 더 이상 조이스틱이 아니라 /collect/set_config 로
+        들어온다 — 여기서는 이미 설정돼 있는지와 state/센서 상태만 본다.
 
         Args:
             mono: 요청 시각(monotonic).
         """
-        if self.current is not None:
-            self.log.warn("이미 기록 중이다. 먼저 종료(9) 버튼을 누를 것.")
+        with self._state_lock:
+            if self.state != STATE_IDLE:
+                self._reject_start(f"state={self.state} (idle 이 아니다)")
+                return
+            if self.layout is None or self.target_color is None:
+                self._reject_start(
+                    "배치/목표색이 설정돼 있지 않다 — 대시보드(/collect)에서 설정할 것")
+                return
+            layout = self.layout
+            target_color = self.target_color
+
+        if not self.odom_fresh():
+            self._reject_start(f"{self.cfg.odom_topic} 미수신")
             return
-        if self.target_color is None:
-            self.log.warn("목표색을 먼저 선택할 것 (색상 버튼).")
+        if not self.camera_fresh():
+            self._reject_start(f"{self.cfg.camera_topic} 미수신")
             return
 
         cfg = self.cfg
         seq = next_episode_seq(cfg.root)
-        name = f"ep{seq:04d}_L{cfg.layout}_{self.target_color}"
+        name = f"ep{seq:04d}_L{layout}_{target_color}"
         ep_dir = cfg.root / name
         while ep_dir.exists():
             seq += 1
-            name = f"ep{seq:04d}_L{cfg.layout}_{self.target_color}"
+            name = f"ep{seq:04d}_L{layout}_{target_color}"
             ep_dir = cfg.root / name
         ep_dir.mkdir(parents=True, exist_ok=False)
         (ep_dir / "rgb").mkdir()
 
         ep = Episode(
-            seq=seq, layout=cfg.layout,
-            target_color=self.target_color, dir_path=ep_dir, t0_mono=mono,
+            seq=seq, layout=layout,
+            target_color=target_color, dir_path=ep_dir, t0_mono=mono,
         )
         ep._fh = ep.csv_path.open("w", encoding="utf-8", newline="")
         ep._writer = csv.writer(ep._fh)
         ep._writer.writerow(TRAJECTORY_HEADER)
         ep._fh.flush()
 
-        self.current = ep
+        with self._state_lock:
+            self.current = ep
+            self.state = STATE_RECORDING
         self._add_event(ep, "episode_start")
         self._write_provisional_episode_json(ep)
         self.log.info(
             f"에피소드 시작 {name} target_side="
-            f"{derive_target_side(cfg.layout, self.target_color)}")
+            f"{derive_target_side(layout, target_color)}")
 
     def _write_provisional_episode_json(self, ep: Episode) -> None:
         """기록 중/중단 시점의 잠정 episode.json (수기 필드는 아직 비움).
@@ -630,8 +722,14 @@ class ColorMarkerRecorder(Node):
             f"에피소드 종료 {ep.name} frames={ep.frames} "
             f"rows={count_csv_rows(ep.csv_path)} status={status}")
 
-        self.current = None
-        self.last_closed = ep
+        with self._state_lock:
+            self.current = None
+            self.last_closed = ep
+            # 정상 종료(9번)만 결과 대기로 넘어간다. 치명 오류로 끊긴
+            # 에피소드(aborted_*)는 애초에 결과를 물을 수 없으므로(운전자가
+            # 판단할 상황이 아니었다) main() 이 즉시 success=False 로 확정한다
+            # — 그쪽은 대시보드/서비스를 거치지 않는다.
+            self.state = STATE_AWAITING_RESULT if status == "done" else STATE_IDLE
         self.episode_closed.set()
 
     def verify_counts(self, ep: Episode) -> list[str]:
@@ -829,38 +927,177 @@ class ColorMarkerRecorder(Node):
             self._cmd_stop(time.monotonic(), status)
         return self.last_closed
 
+    # ── 대시보드 연동: 서비스 콜백 ─────────────────────────────────
+    def _on_set_config(self, request: SetConfig.Request,
+                       response: SetConfig.Response) -> SetConfig.Response:
+        """/collect/set_config — idle 일 때만 배치/목표색을 받아들인다.
+
+        Args:
+            request: layout(1|2|3), target_color(red|green|blue).
+            response: accepted/reason/target_side 를 채워 돌려준다.
+
+        Returns:
+            채워진 response.
+        """
+        with self._state_lock:
+            if self.state != STATE_IDLE:
+                response.accepted = False
+                response.reason = (
+                    f"state={self.state} — 녹화/결과대기 중에는 배치/목표색을 "
+                    "바꿀 수 없다")
+                response.target_side = ""
+                return response
+            if int(request.layout) not in LAYOUTS:
+                response.accepted = False
+                response.reason = f"layout 은 1|2|3 이어야 한다 (받은 값 {request.layout})"
+                response.target_side = ""
+                return response
+            if request.target_color not in TARGET_COLORS:
+                response.accepted = False
+                response.reason = (
+                    "target_color 는 red|green|blue 여야 한다 "
+                    f"(받은 값 {request.target_color!r})")
+                response.target_side = ""
+                return response
+            self.layout = int(request.layout)
+            self.target_color = str(request.target_color)
+            target_side = derive_target_side(self.layout, self.target_color)
+
+        response.accepted = True
+        response.reason = ""
+        response.target_side = target_side
+        self.log.info(
+            f"/collect/set_config 수락: layout={self.layout} "
+            f"target_color={self.target_color} target_side={target_side}")
+        return response
+
+    def _on_submit_result(self, request: SubmitResult.Request,
+                          response: SubmitResult.Response) -> SubmitResult.Response:
+        """/collect/submit_result — awaiting_result 일 때만 결과를 받는다.
+
+        Args:
+            request: success, final_distance, notes.
+            response: accepted/reason 을 채워 돌려준다.
+
+        Returns:
+            채워진 response.
+        """
+        accepted, reason = self._do_submit_result(
+            bool(request.success), float(request.final_distance), str(request.notes))
+        response.accepted = accepted
+        response.reason = reason
+        return response
+
+    def emergency_submit(self) -> tuple[bool, str]:
+        """대시보드 없이 조이스틱 버튼으로 '성공'을 즉시 확정한다(비상구).
+
+        Returns:
+            (수락 여부, 사유/안내 문자열).
+        """
+        return self._do_submit_result(
+            True, EMERGENCY_DEFAULT_DISTANCE, "dashboard-down fallback")
+
+    def _do_submit_result(self, success: bool, final_distance: float,
+                          notes: str) -> tuple[bool, str]:
+        """결과를 확정한다 — /collect/submit_result 서비스와 비상 제출 버튼이 공유.
+
+        awaiting_result 가 아니면 거부한다. 수락되면 낙관적으로 먼저
+        state 를 idle 로 되돌린 뒤(중복 제출 방지) episode.json 을 쓰고
+        verify_errand_session.py 를 돌린다 — 둘 다 몇 초 걸릴 수 있어 락 밖에서
+        한다.
+
+        Args:
+            success: 성공 여부.
+            final_distance: 최종 거리(m).
+            notes: 비고.
+
+        Returns:
+            (수락 여부, 사유/안내 문자열).
+        """
+        with self._state_lock:
+            if self.state != STATE_AWAITING_RESULT:
+                return False, f"state={self.state} (awaiting_result 아님 — 이미 처리됐을 수 있다)"
+            ep = self.last_closed
+            if ep is None:
+                self.state = STATE_IDLE
+                return False, "내부 상태 불일치 — 제출할 에피소드가 없다"
+            self.state = STATE_IDLE
+
+        finalize_episode_json(ep, success, final_distance, None, notes, self.cfg)
+        rc = run_verify(ep)
+        verdict = "검수 OK" if rc == 0 else "재촬영 권장(위 사유 확인)"
+        self.log.info(
+            f"{ep.name} 결과 확정 success={success} "
+            f"final_distance={final_distance} notes={notes!r} 검수={verdict}")
+        return True, f"{ep.name} 저장 완료 — {verdict}"
+
+    # ── 대시보드 연동: 상태 퍼블리셔 ───────────────────────────────
+    def _publish_status(self) -> None:
+        """/collect/status 에 배치/목표색/상태/카운터/센서 상태를 싣는다."""
+        with self._state_lock:
+            layout = self.layout
+            target_color = self.target_color
+            state = self.state
+            last_ep = self.last_closed
+            rejection = self._last_start_rejection
+        target_side = (derive_target_side(layout, target_color)
+                       if layout is not None and target_color is not None else None)
+        counts = scan_counts_all(self.cfg.root)
+        total = sum(sum(c.values()) for c in counts.values())
+        payload: dict[str, Any] = {
+            "layout": layout,
+            "target_color": target_color,
+            "target_side": target_side,
+            "state": state,
+            "counts": counts,
+            "episode_count_total": total,
+            "odom_ok": self.odom_fresh(),
+            "camera_ok": self.camera_fresh(),
+            "frame_hz": round(self.frame_hz(), 2),
+            "last_episode_dir": str(last_ep.dir_path) if last_ep is not None else None,
+            "last_start_rejection": rejection[1] if rejection is not None else None,
+        }
+        try:
+            self._status_pub.publish(String(data=json.dumps(payload)))
+        except Exception as exc:  # noqa: BLE001
+            self.log.error(f"/collect/status 발행 실패: {exc!r}")
+
 
 # ──────────────────────────────────────────────────────────────────────
 # 버튼 매핑
 # ──────────────────────────────────────────────────────────────────────
 
 def build_button_map(cfg: Config) -> tuple[dict[int, str], dict[int, str]]:
-    """긴급정지·시작·종료·목표색 버튼을 매핑한다.
+    """긴급정지·시작·종료·비상 제출 버튼을 매핑한다.
 
-    로봇 위치 선택은 없다 — TASK1/2/3_BUTTON(3/6/7) 은 바인딩하지 않는다.
+    배치/목표색 선택은 더 이상 조이스틱에 없다 — 대시보드가 ROS 서비스로
+    설정한다. 로봇 위치 선택도 없다 — TASK1/2/3_BUTTON(3/6/7) 은 바인딩하지
+    않는다.
 
     Args:
-        cfg: 실행 설정 (red/green/blue 버튼 번호 사용).
+        cfg: 실행 설정.
 
     Returns:
         ({버튼: 액션 키}, {버튼: 설명}).
     """
     jg = load_joystick_module()
+    reserved = reserved_buttons()
+    if EMERGENCY_SUBMIT_BUTTON in reserved:
+        raise SystemExit(
+            f"내부 오류: EMERGENCY_SUBMIT_BUTTON={EMERGENCY_SUBMIT_BUTTON} 이 "
+            f"예약 버튼과 겹친다 ({reserved[EMERGENCY_SUBMIT_BUTTON]}) — "
+            "코드에서 상수를 바꿔야 한다.")
     action = {
         jg.STOP_BUTTON: "estop",
         jg.COLLECT_START_BUTTON: "start",
         jg.COLLECT_STOP_BUTTON: "stop",
-        cfg.red_button: "color_red",
-        cfg.green_button: "color_green",
-        cfg.blue_button: "color_blue",
+        EMERGENCY_SUBMIT_BUTTON: "emergency_submit",
     }
     desc = {
         jg.STOP_BUTTON: "긴급 정지 (모터만 정지, 기록은 계속 + 이벤트 기록)",
-        jg.COLLECT_START_BUTTON: "★ 에피소드 시작 (목표색 선택 후)",
-        jg.COLLECT_STOP_BUTTON: "★ 에피소드 종료 (즉시 — 성공/거리 입력)",
-        cfg.red_button: "★ 목표색 red",
-        cfg.green_button: "★ 목표색 green",
-        cfg.blue_button: "★ 목표색 blue",
+        jg.COLLECT_START_BUTTON: "★ 에피소드 시작 (대시보드에서 배치/목표색 설정 후)",
+        jg.COLLECT_STOP_BUTTON: "★ 에피소드 종료 (즉시 — 결과는 대시보드에서 입력)",
+        EMERGENCY_SUBMIT_BUTTON: "대시보드 다운 비상구 — 결과대기 중 '성공'으로 즉시 제출",
     }
     return action, desc
 
@@ -887,10 +1124,9 @@ def handle_button(rec: ColorMarkerRecorder, act: str, button: int) -> str:
     if act == "stop":
         rec.request_stop("done")
         return f"버튼 {button}: 에피소드 종료 요청"
-    if act.startswith("color_"):
-        color = act.split("_", 1)[1]
-        rec.set_target_color(color)
-        return f"버튼 {button}: 목표색 {color}"
+    if act == "emergency_submit":
+        ok, reason = rec.emergency_submit()
+        return f"버튼 {button}: {'비상 성공 제출 완료' if ok else '비상 제출 무시'} — {reason}"
     return f"버튼 {button}"
 
 
@@ -971,14 +1207,30 @@ def scan_counts(root: Path, layout: int) -> dict[str, int]:
     return counts
 
 
-def print_counts_table(counts: dict[str, int], cfg: Config) -> None:
+def scan_counts_all(root: Path) -> dict[int, dict[str, int]]:
+    """세 배치 전부의 색별 성공 카운트를 만든다 (대시보드 3×3 표용).
+
+    Args:
+        root: --root 경로.
+
+    Returns:
+        {layout: {target_color: 개수}}.
+    """
+    return {layout: scan_counts(root, layout) for layout in LAYOUTS}
+
+
+def print_counts_table(counts: dict[str, int], cfg: Config,
+                       layout: Optional[int]) -> None:
     """색별 누적 카운터(3칸)를 출력한다.
 
     Args:
         counts: scan_counts() 형식의 카운트.
         cfg: 실행 설정 (target_per_color 사용).
+        layout: 표시할 배치 번호. None 이면 "미설정"으로 표시한다(대시보드가
+            아직 배치를 설정하지 않은 상태).
     """
-    print(f"  [누적 카운터 — 배치 {cfg.layout}, 성공한 에피소드만] "
+    layout_label = layout if layout is not None else "미설정"
+    print(f"  [누적 카운터 — 배치 {layout_label}, 성공한 에피소드만] "
           f"(목표: 색당 {cfg.target_per_color})")
     cells = []
     for color in TARGET_COLORS:
@@ -1006,144 +1258,91 @@ def checklist_lines(rec: ColorMarkerRecorder) -> list[str]:
     """
     fresh = rec.odom_fresh()
     odom_box = "☑" if fresh else "☐"
-    odom_tail = "" if fresh else "  ← 미수신! 'bot'/'botcheck' 로 확인할 것"
+    odom_tail = "" if fresh else " ← 미수신! 'bot'/'botcheck' 로 확인할 것"
     return [
-        "  □ 화면에 3색이 모두 보이는가",
-        f"  {odom_box} /wheel/odom 수신 중인가{odom_tail}",
-        "  □ 로봇을 직전 에피소드에서 조금 옮겼는가",
+        "  □ 3색 모두 보임",
+        f"  {odom_box} odom 수신{odom_tail}",
+        "  □ 로봇 위치 변경",
     ]
 
 
 def print_status(cfg: Config, rec: ColorMarkerRecorder,
-                 counts: dict[str, int], joystick: Any,
-                 xyz: tuple[float, float, float], notice: str) -> None:
-    """수집 상태 패널.
+                 joystick: Any, xyz: tuple[float, float, float],
+                 notice: str) -> None:
+    """수집 상태 패널. 카운터는 배치가 바뀔 수 있으므로 매번 디스크에서 다시 센다.
 
     Args:
         cfg: 실행 설정.
         rec: 기록 노드.
-        counts: 누적 카운터.
         joystick: pygame Joystick.
         xyz: 데드존 적용된 (x, y, z) 스틱 값.
         notice: 최근 알림 한 줄.
     """
     jg = load_joystick_module()
-    sep = "-" * 78
-    os.system("cls" if os.name == "nt" else "clear")
+    frame = "═" * 78
+    # os.system("clear") 는 5Hz 로 매번 서브프로세스를 새로 띄워 터미널을
+    # 통째로 지우므로 화면이 깜빡인다. 커서만 홈으로 되돌리고 그 아래를
+    # 지우면(스크롤백은 건드리지 않음) 프로세스 생성 없이 그 자리에서
+    # 다시 그릴 수 있어 깜빡임이 크게 줄어든다.
+    sys.stdout.write("\x1b[H\x1b[J")
 
     x_pos, y_pos, z_pos = xyz
     lx, ly, az = jg.joystick_to_cmd_vel(x_pos, y_pos, z_pos)
 
-    print(sep)
-    print(f"  TIC-VLA 3색 마커 단일 방문 수집 | {joystick.get_name()}")
-    print(f"  SerBOT: {'실제' if jg.SERBOT_AVAILABLE else '더미(Dummy)'} "
-          f"| 백엔드 {jg.bot.name}")
-    print(f"  배치 {cfg.layout}  |  {layout_desc(cfg.layout, ko=True)}")
-    print(sep)
-
     with rec._state_lock:
         ep = rec.current
+        layout = rec.layout
         target_color = rec.target_color
+        state = rec.state
+        rejection = rec._last_start_rejection
 
-    print("  [조종]")
-    print(f"  스틱 x={x_pos:+.3f} y={y_pos:+.3f} z={z_pos:+.3f} "
-          f"| 방향각 {jg.degree_now:6.1f}deg | 속도 {jg.speed:4.1f}/{jg.MAX_SPEED}")
-    print(f"  cmd_vel vx={lx:+.3f} vy={ly:+.3f} wz={az:+.3f} → {cfg.cmd_vel_topic}")
+    # collect_gotoobject.py 의 검수 요약 박스와 같은 스타일 — 위/아래 테두리만
+    # 긋고 안쪽은 들여쓰기만 한 평문. 섹션마다 빈 줄로 나누던 기존 방식은
+    # 한 화면에 다 안 들어와 스크롤이 생기고, 매 틱 지우고 다시 그리다 보니
+    # 그 스크롤 어긋남이 "정신없다"는 느낌으로 이어졌다. 여기서는 조종·조건·
+    # 체크리스트·기록상태·카운터를 한 프레임 안에 눌러 담아 한 번에 훑을 수
+    # 있게 한다. 배치/목표색은 이제 대시보드가 설정하므로 여기는 읽기 전용
+    # 표시만 한다 — 버튼 안내가 없다.
+    print(f"╔{frame}╗")
+    print(f"■ TIC-VLA 3색 마커 수집 | {joystick.get_name()} | "
+          f"SerBOT {'실제' if jg.SERBOT_AVAILABLE else '더미'}({jg.bot.name})")
+    print(f"  state: {state}"
+          + (f"  |  배치 {layout} — {layout_desc(layout, ko=True)}"
+             if layout is not None else "  |  배치 (미설정 — 대시보드에서 설정)"))
+    print(f"  스틱 x={x_pos:+.2f} y={y_pos:+.2f} z={z_pos:+.2f} "
+          f"→ cmd_vel vx={lx:+.2f} vy={ly:+.2f} wz={az:+.2f} → {cfg.cmd_vel_topic}")
 
-    print()
-    print("  [선택된 조건]")
-    print(f"  목표색 : {target_color or '(미선택 — 색상 버튼을 누르세요)'} "
-          f"(red={cfg.red_button} green={cfg.green_button} blue={cfg.blue_button})")
-    if target_color:
-        side = derive_target_side(cfg.layout, target_color)
-        print(f"  target_side (자동 유도) : {side}")
-        print(f"  instruction : {INSTRUCTIONS[target_color]!r}")
+    print(f"  목표색: {target_color or '(미설정 — 대시보드에서 설정)'}")
+    if layout is not None and target_color:
+        side = derive_target_side(layout, target_color)
+        print(f"  target_side: {side}  |  instruction: {INSTRUCTIONS[target_color]!r}")
+    print("  체크: " + "   ".join(line.strip() for line in checklist_lines(rec)))
 
-    print()
-    print("  [체크리스트]")
-    for line in checklist_lines(rec):
-        print(line)
-
-    print()
     if ep is not None:
         dur = time.monotonic() - ep.t0_mono
         rows = count_csv_rows(ep.csv_path)
-        print("  [기록 중]")
-        print(f"  폴더 : {ep.dir_path}")
-        print(f"  프레임 {ep.frames}  행 {rows}  경과 {dur:5.1f}s  stall {ep.stall_ticks}")
+        print(f"  [기록 중] {ep.dir_path}  프레임 {ep.frames}  행 {rows}  "
+              f"경과 {dur:5.1f}s  stall {ep.stall_ticks}")
+    elif state == STATE_AWAITING_RESULT:
+        print("  [결과 대기] — 대시보드(/collect)에서 성공/실패를 입력하세요"
+              f" (또는 버튼 {EMERGENCY_SUBMIT_BUTTON}=비상 성공 제출)")
     else:
-        print("  [대기 중] — 조건 선택 후 8번으로 시작하세요")
+        print("  [대기 중] — 대시보드에서 배치/목표색 설정 후 8번으로 시작하세요"
+              + (f"  ← 직전 시작 거부: {rejection[1]}" if rejection is not None else ""))
+    counts = (scan_counts(cfg.root, layout) if layout is not None
+             else {c: 0 for c in TARGET_COLORS})
+    print_counts_table(counts, cfg, layout)
 
-    print()
-    print_counts_table(counts, cfg)
-
-    print(sep)
-    print("  8=시작  9=종료  0=긴급정지  "
-          f"{cfg.red_button}=red {cfg.green_button}=green {cfg.blue_button}=blue")
+    footer = f"  8=시작  9=종료  0=긴급정지  {EMERGENCY_SUBMIT_BUTTON}=결과 비상제출(성공)"
     if notice:
-        print(f"  알림: {notice}")
+        footer += f"  |  알림: {notice}"
+    print(footer)
+    print(f"╚{frame}╝")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 종료 시 수기 입력
+# 결과 확정 (입력은 대시보드/비상 제출 버튼에서 온다 — 콘솔 프롬프트 없음)
 # ──────────────────────────────────────────────────────────────────────
-
-def prompt_yes_no(prompt: str) -> bool:
-    """y/n 만 받는다.
-
-    Args:
-        prompt: 표시할 문구.
-
-    Returns:
-        True(y) / False(n).
-    """
-    while True:
-        ans = input(prompt).strip().lower()
-        if ans in ("y", "yes"):
-            return True
-        if ans in ("n", "no"):
-            return False
-        print("  y 또는 n 을 입력하세요.")
-
-
-def prompt_float(prompt: str) -> Optional[float]:
-    """대략값 float. 빈 입력이면 None(모름) 을 허용한다.
-
-    Args:
-        prompt: 표시할 문구.
-
-    Returns:
-        float 또는 None.
-    """
-    while True:
-        ans = input(prompt).strip()
-        if not ans:
-            return None
-        try:
-            return float(ans)
-        except ValueError:
-            print("  숫자를 입력하거나 모르면 그냥 Enter.")
-
-
-def prompt_episode_report(ep: Episode) -> tuple[bool, Optional[float], Optional[float], str]:
-    """정상 종료(9번) 시 콘솔로 결과를 묻는다.
-
-    Args:
-        ep: 방금 닫힌 에피소드.
-
-    Returns:
-        (success, final_distance, start_distance_approx, notes).
-    """
-    print("")
-    print("=" * 60)
-    print(f"  에피소드 종료: {ep.name} — 결과를 입력하세요")
-    print("=" * 60)
-    success = prompt_yes_no("  마커 앞에서 성공적으로 정지했나요? (y/n): ")
-    final_distance = prompt_float("  최종 거리(m, 대략, 모르면 Enter): ")
-    start_distance_approx = prompt_float("  시작 거리(m, 대략, 모르면 Enter): ")
-    notes = input("  메모(선택, 없으면 Enter): ").strip()
-    return success, final_distance, start_distance_approx, notes
-
 
 def finalize_episode_json(ep: Episode, success: Optional[bool],
                           final_distance: Optional[float],
@@ -1252,8 +1451,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description="TIC-VLA 3색 마커 단일 방문 에피소드 수집기",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--layout", required=True, type=int, choices=list(LAYOUTS),
-                        help="마커 배치(1/2/3). 세션 중 바뀌지 않는다")
     parser.add_argument("--root", default=default_root(),
                         help="저장 루트. 이 아래 바로 ep{NNNN}_... 폴더가 쌓인다")
     parser.add_argument("--target-per-color", type=int, default=8,
@@ -1268,12 +1465,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--cmd-vel-topic",
         default=os.environ.get("JOYSTICK_CMD_VEL_TOPIC", "/joystick_cmd_vel"),
         help="조이스틱 입력을 내보낼 Twist 토픽 (기존 스택 호환용)")
-    parser.add_argument("--red-button", type=int, default=1,
-                        help="목표색 red 버튼 (원본이 안 쓰는 번호여야 한다)")
-    parser.add_argument("--green-button", type=int, default=5,
-                        help="목표색 green 버튼")
-    parser.add_argument("--blue-button", type=int, default=10,
-                        help="목표색 blue 버튼")
     parser.add_argument("--sensor-timeout", type=float, default=5.0,
                         help="시작 시 odom/카메라 수신 대기 최대 초")
     parser.add_argument("--odom-stall-sec", type=float, default=0.5,
@@ -1305,24 +1496,6 @@ def build_config(args: argparse.Namespace) -> Config:
     if not 1 <= args.jpeg_quality <= 100:
         raise SystemExit("ERROR: --jpeg-quality 는 1~100")
 
-    # 여기서부터 SerBot 백엔드가 로드된다 (버튼 상수 확인 필요).
-    reserved = reserved_buttons()
-    color_buttons = {
-        "--red-button": args.red_button,
-        "--green-button": args.green_button,
-        "--blue-button": args.blue_button,
-    }
-    free_hint = [b for b in range(16) if b not in reserved]
-    for flag, btn in color_buttons.items():
-        if btn in reserved:
-            raise SystemExit(
-                f"ERROR: {flag} {btn} 은 원본이 이미 쓴다 ({reserved[btn]}). "
-                f"남는 번호(참고, 실제 버튼 수는 조이스틱에 따라 다름): {free_hint}")
-    if len({args.red_button, args.green_button, args.blue_button}) != 3:
-        raise SystemExit(
-            "ERROR: --red-button/--green-button/--blue-button 은 서로 달라야 한다: "
-            f"{color_buttons}")
-
     root = Path(args.root).expanduser().resolve()
     if "GoToObject_v1" in root.parts:
         raise SystemExit(
@@ -1331,7 +1504,6 @@ def build_config(args: argparse.Namespace) -> Config:
     root.mkdir(parents=True, exist_ok=True)
 
     return Config(
-        layout=int(args.layout),
         root=root,
         target_per_color=int(args.target_per_color),
         hz=float(args.hz),
@@ -1339,9 +1511,6 @@ def build_config(args: argparse.Namespace) -> Config:
         odom_topic=str(args.odom_topic),
         camera_topic=str(args.camera_topic),
         cmd_vel_topic=str(args.cmd_vel_topic),
-        red_button=int(args.red_button),
-        green_button=int(args.green_button),
-        blue_button=int(args.blue_button),
         sensor_timeout=float(args.sensor_timeout),
         odom_stall_sec=float(args.odom_stall_sec),
         camera_stall_sec=float(args.camera_stall_sec),
@@ -1402,7 +1571,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     action_map, desc_map = build_button_map(cfg)
 
     print("")
-    print(f"[설정] 배치     : {cfg.layout}  |  {layout_desc(cfg.layout)}")
+    print("[설정] 배치/목표색: 대시보드(/collect)에서 설정 — 여기엔 없다")
     print(f"[설정] 저장 루트: {cfg.root}")
     print(f"[설정] 저장     : {cfg.hz}Hz, 원본 해상도(리사이즈 없음), "
           f"JPEG q={cfg.jpeg_quality}")
@@ -1427,7 +1596,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         if exit_code != EXIT_OK:
             return exit_code
 
-        counts = scan_counts(cfg.root, cfg.layout)
         joystick = jg.init_pygame_and_joystick()
         print_button_table(cfg, desc_map, joystick)
 
@@ -1435,7 +1603,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         clock = pygame.time.Clock()
         debug_interval = max(1, int(jg.UPDATE_HZ / jg.DEBUG_HZ))
         frame_count = 0
-        notice = "조건을 선택한 뒤 8번으로 시작하세요"
+        notice = "대시보드(/collect)에서 배치/목표색을 설정한 뒤 8번으로 시작하세요"
         xyz = (0.0, 0.0, 0.0)
 
         while True:
@@ -1477,16 +1645,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 rec.publish_cmd_vel(0.0, 0.0, 0.0)
                 if ep is not None:
                     if ep.status == "done":
-                        success, final_d, start_d, notes = prompt_episode_report(ep)
+                        # 결과 입력은 이제 대시보드(/collect/submit_result) 나
+                        # 비상 제출 버튼이 한다 — 여기서는 상태를
+                        # awaiting_result 로 넘긴 채 알림만 띄운다.
+                        notice = (
+                            f"{ep.name} 종료 — 대시보드에서 결과를 입력하세요 "
+                            f"(또는 버튼 {EMERGENCY_SUBMIT_BUTTON}=비상 성공 제출)")
                     else:
-                        success, final_d, start_d, notes = (
-                            False, None, None, f"치명 오류로 중단: {ep.status}")
-                    finalize_episode_json(ep, success, final_d, start_d, notes, cfg)
-                    if success:
-                        counts[ep.target_color] += 1
-                    rc = run_verify(ep)
-                    notice = (f"{ep.name} 저장 완료 — "
-                              f"{'검수 OK' if rc == 0 else '재촬영 권장(위 사유 확인)'}")
+                        finalize_episode_json(
+                            ep, False, None, None,
+                            f"치명 오류로 중단: {ep.status}", cfg)
+                        rc = run_verify(ep)
+                        notice = (f"{ep.name} 저장 완료(중단) — "
+                                  f"{'검수 OK' if rc == 0 else '재촬영 권장(위 사유 확인)'}")
 
             if rec.fatal is not None:
                 jg.stop_serbot()
@@ -1494,7 +1665,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 break
 
             if frame_count % debug_interval == 0:
-                print_status(cfg, rec, counts, joystick, xyz, notice)
+                print_status(cfg, rec, joystick, xyz, notice)
             frame_count += 1
             clock.tick(jg.UPDATE_HZ)
 
@@ -1536,10 +1707,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print("")
     print("=" * 78)
-    print("  수집 종료")
+    print("  수집 종료 — 배치별 누적")
     print("=" * 78)
-    final_counts = scan_counts(cfg.root, cfg.layout)
-    print_counts_table(final_counts, cfg)
+    for layout, layout_counts in scan_counts_all(cfg.root).items():
+        print_counts_table(layout_counts, cfg, layout)
     print("=" * 78)
 
     if rec.fatal == "odom":

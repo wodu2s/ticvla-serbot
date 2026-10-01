@@ -788,84 +788,53 @@ for layout in (1, 2, 3):
     counts = m.scan_counts(root, layout)
     cfg = SimpleNamespace(layout=layout, target_per_color=8)
     print(f"배치 {layout}  |  {m.layout_desc(layout, ko=True)}")
-    m.print_counts_table(counts, cfg)
+    m.print_counts_table(counts, cfg, layout)
     print("")
 PYEOF
-}
-
-# 실행 직전에 배치 색-슬롯 대응을 크게 보여주고 마커를 그렇게 놓았는지
-# 한 번 확인받는다 — 배치를 안 바꾸고 돌리면 그 24개가 통째로 무의미해진다.
-# 이 수집에서 가장 흔할 실수라 매번 물어본다.
-_colrec_confirm_layout() {
-    local layout="$1"
-    local desc
-    desc=$(PYGAME_HIDE_SUPPORT_PROMPT=1 python3 - "$SERBOT_COLLECT_DIR" "$layout" <<'PYEOF'
-import sys
-sys.path.insert(0, sys.argv[1])
-import joystick_colormarker as m
-print(m.layout_desc(int(sys.argv[2]), ko=True))
-PYEOF
-    )
-    echo ""
-    echo "############################################################"
-    echo "  배치 $layout 확인"
-    echo "  $desc"
-    echo "############################################################"
-    local ans
-    read -r "ans?  마커를 이 배치대로 놓았습니까? [y/N]: "
-    if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
-        echo "✗ 배치 확인 실패 — 마커를 다시 놓고 다시 실행하세요."
-        return 1
-    fi
-    return 0
 }
 
 function colrec() {
     if [[ "$1" == "-h" || "$1" == "--help" ]]; then
         cat <<EOF
-사용법: colrec <1|2|3> [joystick_colormarker.py 추가 인자...]
-  3색 마커 수집을 한 명령으로 돌린다.
+사용법: colrec [joystick_colormarker.py 추가 인자...]
+  3색 마커 수집을 한 명령으로 돌린다. 배치/목표색 선택과 확인, 결과 입력은
+  이제 웹 대시보드(/collect 페이지)가 맡는다 — 여기엔 그 인자가 없다.
     1) 사전 점검 — odom/joint/camera 를 echo·stamp 로 확인 (Hz 는 보조).
        joint_states 가 죽어 있거나 카메라 echo 가 실패하면 여기서 중단한다.
     2) camera_node 와 ticvla_bridge.py(--camera-topic 없이 직접 오픈)가
        동시에 CSI 를 열려고 하면 중단하고 안내한다.
-    3) 배치 색-슬롯 대응을 크게 보여주고 "이 배치대로 놓았는가" 를 확인받는다
-       (y 아니면 중단) — 배치를 안 바꾸고 돌리면 그 회차가 통째로 무의미해진다.
-    4) collect/joystick_colormarker.py --layout <1|2|3> 를 실행한다.
+    3) collect/joystick_colormarker.py 를 실행한다 — 배치/목표색은 대시보드
+       (/collect)에서 설정하고, 조이스틱은 주행 + 시작(8)/종료(9)만 맡는다.
        (에피소드마다 verify_errand_session.py 자동 검수·요약이 이미 내장돼 있다.)
-    5) 로그: $SERBOT_LOG_DIR/colrec_L<layout>_<타임스탬프>.log
+    4) 로그: $SERBOT_LOG_DIR/colrec_<타임스탬프>.log
 
-  인자 없이 부르면 배치별(1/2/3) 누적 현황만 보여주고 끝낸다.
+  실행할 때마다 시작 전에 배치별(1/2/3) 누적 현황을 먼저 보여준다.
 EOF
         return 0
     fi
 
-    if [[ $# -eq 0 ]]; then
-        echo "사용법: colrec <1|2|3>   (colrec -h 로 도움말)"
-        echo ""
-        _colrec_counts_table
-        return 0
-    fi
-
-    local layout="$1"
-    if [[ "$layout" != "1" && "$layout" != "2" && "$layout" != "3" ]]; then
-        echo "✗ layout 은 1, 2, 3 중 하나여야 합니다: $layout" >&2
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        echo "✗ colrec 는 더 이상 배치 인자를 받지 않습니다 — 배치/목표색은" >&2
+        echo "   웹 대시보드(/collect)에서 설정하세요. 그냥 'colrec' 로 실행하세요." >&2
         return 2
     fi
-    shift
 
     if [[ ! -f "$SERBOT_JOYSTICK_COLORMARKER" ]]; then
         echo "✗ 수집기를 찾을 수 없습니다: $SERBOT_JOYSTICK_COLORMARKER" >&2
         return 1
     fi
 
-    _colrec_confirm_layout "$layout" || return 1
-
+    # joystick_colormarker.py 가 이제 collect_interfaces(ros2_ws 오버레이)를
+    # import 하므로, 누적 현황 표(_colrec_counts_table 도 같은 모듈을 로드한다)
+    # 보다 먼저 ROS 환경을 소싱해야 한다.
     _serbot_source_ros || return 1
     _serbot_ros_warmup
     mkdir -p "$SERBOT_LOG_DIR"
 
-    echo "== 3색 마커 수집 사전 점검 (배치 $layout) =="
+    _colrec_counts_table
+    echo ""
+
+    echo "== 3색 마커 수집 사전 점검 =="
 
     # 1) echo 가 기준이다. Hz 만 보면 BEST_EFFORT 카메라/짧은 윈도우가
     #    무수신으로 나오고, odom Hz 만 살아 있으면 환각 궤적을 통과시킨다.
@@ -920,12 +889,15 @@ EOF
     fi
     echo "✓ 카메라 점유 충돌 없음"
 
-    local logf="$SERBOT_LOG_DIR/colrec_L${layout}_$(date +%y%m%d_%H%M%S).log"
+    local logf="$SERBOT_LOG_DIR/colrec_$(date +%y%m%d_%H%M%S).log"
+    local ip
+    ip=$(_serbot_ip)
     echo ""
-    echo "== 수집 시작 (배치 $layout) — 로그: $logf =="
+    echo "== 수집 시작 — 로그: $logf =="
+    echo "   대시보드에서 배치/목표색 설정 · 결과 입력: http://${ip}:${SERBOT_DASHBOARD_PORT}/collect"
     echo ""
 
-    python3 "$SERBOT_JOYSTICK_COLORMARKER" --layout "$layout" "$@" 2>&1 | tee "$logf"
+    python3 "$SERBOT_JOYSTICK_COLORMARKER" "$@" 2>&1 | tee "$logf"
     local rc=${pipestatus[1]}
 
     echo ""
@@ -934,5 +906,6 @@ EOF
     else
         echo "✗ colrec 비정상 종료 (코드 $rc) — 로그: $logf"
     fi
+    echo "   대시보드: http://${ip}:${SERBOT_DASHBOARD_PORT}/collect"
     return $rc
 }

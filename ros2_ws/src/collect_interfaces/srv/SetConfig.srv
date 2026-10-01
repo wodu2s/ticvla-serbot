@@ -1,0 +1,6 @@
+int8 layout
+string target_color
+---
+bool accepted
+string reason
+string target_side

@@ -1085,7 +1085,11 @@ def print_status(cfg: Config, rec: ErrandRecorder, joystick: Any,
     """
     jg = load_joystick_module()
     sep = "-" * 74
-    os.system("cls" if os.name == "nt" else "clear")
+    # os.system("clear") 는 매 프레임 서브프로세스를 새로 띄워 터미널을
+    # 통째로 지우므로 화면이 깜빡인다. 커서만 홈으로 되돌리고 그 아래를
+    # 지우면(스크롤백은 건드리지 않음) 프로세스 생성 없이 그 자리에서
+    # 다시 그릴 수 있어 깜빡임이 크게 줄어든다.
+    sys.stdout.write("\x1b[H\x1b[J")
 
     x_pos, y_pos, z_pos = xyz
     lx, ly, az = jg.joystick_to_cmd_vel(x_pos, y_pos, z_pos)

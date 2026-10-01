@@ -1,0 +1,62 @@
+diff --git a/data/s01_batch_json_generation.py b/data/s01_batch_json_generation.py
+index f17ebba..b3fa267 100644
+--- a/data/s01_batch_json_generation.py
++++ b/data/s01_batch_json_generation.py
+@@ -22,16 +22,17 @@ import pandas as pd
+ # Config
+ # =========================
+ OUT_BASE_DIR = None
+-SRC_HZ = 30.0
++SRC_HZ = 10.0                       # GoToObject 수집은 10Hz 저장 (구 Isaac 30Hz 아님)
+ DST_HZ = 10.0
+ STEP_SEC = 1.0 / DST_HZ  # 0.1 s
+ WINDOW_SIZE_SECONDS = 20.0  # Each window is 20 seconds
+-WINDOW_SLIDE_SECONDS = 10.0  # Slide window by 10 seconds (overlap = 20 - 10 = 10 seconds)
++WINDOW_SLIDE_SECONDS = 2.0          # 10→2: 30초 에피소드당 윈도우를 늘려 학습 샘플 확보
+ 
+ # If your trajectory.csv quats/poses are CAMERA->WORLD (from view inversion),
+ # convert them to BODY/BASE->WORLD with body->camera extrinsics (R_bc, t_bc).
++# GoToObject 휠 odom 은 이미 body→world FLU 이므로 False.
+ # If your CSV is ALREADY BODY->WORLD, set USE_CAMERA_OPTICAL_TO_FLU=False and keep R_bc=I, t_bc=0.
+-USE_CAMERA_OPTICAL_TO_FLU = True   # True if CSV is camera pose and camera uses optical frame axes
++USE_CAMERA_OPTICAL_TO_FLU = False   # 휠 odom(REP-103 body FLU) — optical 변환 금지
+ 
+ # camera->body extrinsics (R_cb, R_bc, t_bc), defaults:
+ # - optical camera frame: x right, y down, z forward
+@@ -179,13 +180,23 @@ def build_10hz_grid(n_src_rows: int):
+ def process_scene(scene_dir: Path):
+     scene_dir = scene_dir.resolve()
+     traj_csv = scene_dir / "trajectory.csv"
+-    instr_txt = scene_dir / "instruction.txt"
+-    
++    meta_json = scene_dir / "meta.json"
++
+     # Validate required files exist
+     if not traj_csv.exists():
+         raise FileNotFoundError(f"Required file not found: {traj_csv}")
+-    if not instr_txt.exists():
+-        raise FileNotFoundError(f"Required file not found: {instr_txt}")
++    # instruction 은 episode meta.json 에만 둔다 (legacy instruction.txt 불필요).
++    # s01 은 지시문 본문을 쓰지 않고, s02 가 per-frame instruction 파일을 생성한다.
++    if meta_json.exists():
++        try:
++            meta = json.loads(meta_json.read_text(encoding="utf-8"))
++            if not str(meta.get("instruction", "")).strip():
++                raise ValueError(f"meta.json has empty instruction: {meta_json}")
++        except json.JSONDecodeError as exc:
++            raise ValueError(f"Invalid meta.json: {meta_json}: {exc}") from exc
++    elif not (scene_dir / "instruction.txt").exists():
++        raise FileNotFoundError(
++            f"Neither meta.json nor instruction.txt found in {scene_dir}")
+     
+     rgb_dir = find_rgb_dir(scene_dir)
+ 
+@@ -266,7 +277,7 @@ def process_scene(scene_dir: Path):
+     pos_10  = p_bw
+     quat_10 = q_bw
+ 
+-    # instruction.txt was already validated at the start
++    # instruction 출처(meta.json 또는 legacy instruction.txt)는 위에서 검증함.
+     # Store the per-frame instruction_file path.
+     # The instruction-generation step will write these files later.
+     rgb_abs_root = rgb_dir.resolve().as_posix()
