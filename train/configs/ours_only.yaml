@@ -1,0 +1,78 @@
+# ============================================================
+# ours_only.yaml — 1차 본학습, 대조군 (teacher_answer=keep)
+#
+# noleak.yaml 과 "teacher_answer" 한 값만 다르고 나머지는 전부 동일해야 한다.
+# noleak 이 1차 실험의 본진이고 이건 재현용 기준선(레포 원본과 동일 조건)이다.
+#
+# 실행 순서: smoke → noleak → ours_only.
+# smoke(train/configs/smoke.yaml) 가 에러 없이 통과한 뒤에만 돌릴 것.
+#
+# ★ 모든 경로는 학습서버(billy) 기준이다. 로봇 경로(/home/soda/...) 쓰지 말 것.
+# ============================================================
+
+# ── 모델 / 체크포인트 ──
+model_path: /home/billy/TIC-VLA/models/InternVL3-1B
+vlm_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+action_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+# ★ WrapperConfig 전용 필드(train_wrapper.py:132). 합본 파일을 그대로 쓴다 —
+#   분리 스크립트 불필요. 실측: 1324키가 vlm(637)/vlm_model.vlm(637)/action_expert(50)
+#   로 정확히 갈리고 "그 외" 0개.
+
+# ── 데이터 경로 ──
+# TODO: 03_make_splits.py 출력 경로로 채울 것 (아직 레포에 스크립트 없음).
+train_data_dir:
+  - "<TRAIN_DIR>"
+val_data_dir: "<VAL_DIR>"
+# ★ null 금지 — 비우면 레포가 샘플 단위 random_split 을 해서 누수가 생긴다 (F4).
+
+# ── 고정값 (ours_only / noleak 공통, 바꾸지 말 것) ──
+precision: "bf16-mixed"
+action_horizon_steps: 30
+# ★ 30 고정. action_chunk_embed.weight 가 30×512 로 고정돼 있어 바꾸면 사전학습
+#   action head 를 이어받지 못한다 (ticvla.py:216).
+max_sequence_length: 90
+smooth_l1_beta: 1.0
+teacher_answer: keep
+# keep = 레포 원본과 동일 조건(사전학습 때와 같은 프롬프트 구성). noleak.yaml 과
+# 이 값만 다르다 — 그게 1차 실험의 핵심 비교다.
+
+# ── 1차 본학습 하이퍼파라미터 ──
+batch_size: 2
+# 2 로 시작. A5000 24GB 1장, 공유 서버라 batch 64 는 불가능. nvidia-smi 보며
+# 여유 있으면 4 → 8 로 올린다. VLM 은 동결이라 옵티마이저 상태는 없지만, VLM
+# forward 의 use_cache=True 때문에 샘플당 delayed 이미지 3~4장 × 256 토큰 ≈
+# 1,000+ 이미지 토큰의 전 레이어 KV 캐시가 메모리에 남는 게 진짜 비용이다
+# (실제로 action head 가 쓰는 건 마지막 레이어뿐인데도).
+accumulate_grad_batches: 8
+# 유효 배치 16. 원본(레포) 64 를 고집하지 않는다 — 우리 데이터가 ~1만1천 샘플
+# (72 에피소드 → 윈도우 약 288 → 폴더별 5개마다 1개 샘플링 적용 후 실측치)이라
+# 유효배치보다 스텝 수 확보가 더 중요하다 (epoch 당 약 690 스텝).
+num_workers: 6
+# 이미지 디코딩이 CPU 바운드라 6~8 사이.
+max_epochs: 6
+# 원본(레포 기본) 10. 데이터가 좁아(단일 태스크, 72 에피소드) 과적합 방지 차원에서 줄인다.
+learning_rate: 5.0e-5
+# ★ 근거: 합본 체크포인트 hparams 에 남아 있는 사전학습 실제값(실측) —
+#     learning_rate=2e-4, max_epochs=10, warmup_steps=1000,
+#     action_horizon_steps=30, action_num_layers=3
+#   레포 yaml 기본값 1e-4 는 사전학습에 쓰인 값이 "아니다." 그렇다고 2e-4 를
+#   그대로 쓰는 것도 틀렸다 — 그건 랜덤 초기화 head 를 대규모 데이터로 처음
+#   학습시킬 때의 값이다. 우리는 반대로 "이미 학습된 head 를 단일 태스크의
+#   좁은 데이터로 미세조정"하는 상황이라, 사전학습 LR 을 그대로 쓰면 초반
+#   수백 스텝에서 사전학습 지식이 씻겨 나가 action head 를 이어받은 의미가
+#   없어진다. 5e-5 로 시작.
+#   판단 기준: train_action_loss 가 초기 수백 스텝에 급등하면 LR 이 높은 것 —
+#   그때는 2e-5 로 내릴 것.
+warmup_steps: 200
+# 사전학습 때의 1000 은 훨씬 큰 데이터(원본 전체) 기준값이다. 우리 스텝 수
+# (epoch 당 약 690 스텝)엔 과하다.
+val_check_interval: 0.5
+
+# ── 저장 경로 ──
+# ★ ModelCheckpoint dirpath 가 "{save_dir}/action" 으로 experiment_name 과 무관하게
+#   고정된다(train_wrapper.build_trainer, STAGE="action"). noleak.yaml 과 save_dir 를
+#   공유하면 save_last=True 체크포인트가 서로 덮어써 1차 실험의 핵심 비교(keep vs
+#   drop)가 불가능해진다. 반드시 분리할 것.
+save_dir: outputs/checkpoints/ours_only
+log_dir: outputs/logs/ours_only
+experiment_name: ticvla_ours_only

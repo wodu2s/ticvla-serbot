@@ -1,0 +1,66 @@
+# ============================================================
+# smoke.yaml — 관통 확인 전용
+#
+# 성공 기준은 loss 값이 아니라 "에러 없이 한 바퀴 돌고 체크포인트가
+# export 경로까지 정상적으로 떨어진다" 이다. 수렴 여부는 보지 않는다.
+#
+# 실행 순서: smoke → noleak → ours_only.
+# smoke 가 통과하기 전에는 절대 본학습(ours_only/noleak)을 걸지 말 것 —
+# 밤새 돌려놓고 아침에 첫 배치에서 죽어 있는 사고가 가장 흔하다.
+#
+# ★ 모든 경로는 학습서버(billy) 기준이다. 로봇 경로(/home/soda/...) 쓰지 말 것.
+# ============================================================
+
+# ── 모델 / 체크포인트 ──
+model_path: /home/billy/TIC-VLA/models/InternVL3-1B
+vlm_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+action_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+# ★ action_checkpoint 는 레포 TrainingConfig 에 없는 우리 전용 필드(WrapperConfig,
+#   train_wrapper.py:132). 분리 스크립트 없이 vlm_checkpoint 와 같은 합본 파일을
+#   그대로 넣는다. 실측 확인: 1324키가 model.vlm.*(637) / model.vlm_model.vlm.*(637)
+#   / model.action_expert.*(50) 로 정확히 갈리고 "그 외" 0개.
+
+# ── 데이터 경로 ──
+# TODO: 03_make_splits.py 가 아직 레포에 없다. 그 스크립트가 만들어져 train/val 경로가
+# 나오면 아래 두 값을 채울 것. 그 전까지는 플레이스홀더로 둔다.
+train_data_dir:
+  - "<TRAIN_DIR>"
+val_data_dir: "<VAL_DIR>"
+# ★ val_data_dir 를 null/빈 값으로 두지 말 것. 비우면 레포가 샘플 단위 random_split
+#   을 하고(vlm_data.py:702, policy_data.py:615), 윈도우가 인접한 샘플이 train/val
+#   에 쪼개져 들어가 누수가 생긴다. train_wrapper.resolve_settings() 가 이 값이
+#   비어 있으면 즉시 ValueError 로 막긴 하지만(F4 가드), 그 가드를 거치지 않는
+#   경로(레포 원본 train.py 등)로 실수로 돌리는 일이 없도록 여기서도 항상 명시한다.
+
+# ── 고정값 (세 config 공통, 바꾸지 말 것) ──
+precision: "bf16-mixed"
+action_horizon_steps: 30
+# ★ 30 고정. 합본 체크포인트의 action_chunk_embed.weight 가 이 값(num_chunks)으로
+#   shape 이 고정돼 있어(ticvla.py:216) 60 등으로 바꾸면 load_state_dict 가 shape
+#   불일치로 실패해 사전학습 action head 를 못 이어받는다. 예측 지평은 3초까지.
+max_sequence_length: 90
+smooth_l1_beta: 1.0
+teacher_answer: keep
+# smoke 는 관통 확인용이라 keep/drop 어느 쪽이든 상관없다. 레포 기본 경로(keep)로 둔다.
+
+# ── smoke 전용 ──
+batch_size: 1
+accumulate_grad_batches: 1
+num_workers: 2
+max_epochs: 1
+limit_train_batches: 5
+limit_val_batches: 2
+# ★ 0 으로 두지 말 것. create_callbacks 의 ModelCheckpoint 가 monitor="val_total_loss"
+#   기준이라(train.py:264, STAGE="action") validation 이 최소 한 번은 돌아야 체크포인트
+#   export 경로까지 확인할 수 있다 — 이게 이 config 의 존재 이유다.
+num_sanity_val_steps: 0
+
+# ── 저장 경로 ──
+# ★ build_trainer() 의 ModelCheckpoint dirpath 는 "{save_dir}/action" 으로
+#   experiment_name 과 무관하게 고정된다(train_wrapper.py build_trainer,
+#   STAGE="action" 하드코딩). smoke/ours_only/noleak 이 save_dir 를 공유하면
+#   save_last=True 체크포인트("last.ckpt")가 서로 덮어쓴다. 세 config 모두
+#   save_dir/log_dir 를 반드시 분리할 것.
+save_dir: outputs/checkpoints/smoke
+log_dir: outputs/logs/smoke
+experiment_name: ticvla_smoke

@@ -1,0 +1,85 @@
+# ============================================================
+# noleak.yaml — ★ 1차 학습의 진짜 실험 (teacher_answer=drop)
+#
+# ours_only.yaml 과 "teacher_answer" 한 값만 다르다. 나머지 전부 동일.
+# 실질적으로 이게 1차의 본진이고, ours_only(keep) 는 대조군/재현용 기준선이다.
+#
+# 실행 순서: smoke → noleak → ours_only.
+# smoke(train/configs/smoke.yaml) 가 에러 없이 통과한 뒤에만 돌릴 것.
+# 이 한 쌍(noleak/ours_only)은 반드시 같이 돌린다.
+#
+# ★ 모든 경로는 학습서버(billy) 기준이다. 로봇 경로(/home/soda/...) 쓰지 말 것.
+# ============================================================
+
+# ── 모델 / 체크포인트 ──
+model_path: /home/billy/TIC-VLA/models/InternVL3-1B
+vlm_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+action_checkpoint: /home/billy/TIC-VLA/checkpoints/TIC-VLA-model.ckpt
+# ★ WrapperConfig 전용 필드. 합본 파일 그대로 사용 — 분리 스크립트 불필요.
+#   실측: 1324키가 vlm(637)/vlm_model.vlm(637)/action_expert(50) 로 정확히 갈리고
+#   "그 외" 0개.
+
+# ── 데이터 경로 ──
+# TODO: 03_make_splits.py 출력 경로로 채울 것 (아직 레포에 스크립트 없음).
+# ours_only.yaml 과 반드시 "같은" train/val 경로를 써야 비교가 성립한다.
+train_data_dir:
+  - "<TRAIN_DIR>"
+val_data_dir: "<VAL_DIR>"
+# ★ null 금지 — 비우면 레포가 샘플 단위 random_split 을 해서 누수가 생긴다 (F4).
+
+# ── 고정값 (ours_only / noleak 공통, 바꾸지 말 것) ──
+precision: "bf16-mixed"
+action_horizon_steps: 30
+# ★ 30 고정. action_chunk_embed.weight 가 30×512 로 고정돼 있어 바꾸면 사전학습
+#   action head 를 이어받지 못한다 (ticvla.py:216).
+max_sequence_length: 90
+smooth_l1_beta: 1.0
+
+teacher_answer: drop
+# ★ ours_only.yaml 과 유일하게 다른 값.
+#
+# 배경: 레포의 학습 프롬프트는 assistant 롤에 정답 waypoint 를
+# <answer>(x, y, theta), ...</answer> 문자열로 넣는다(vlm_data.py:281-286). 그
+# messages 가 apply_chat_template 로 토크나이즈돼 VLM 에 들어가고, 그 past_key_values
+# 가 action head 의 주 입력이 된다. 반면 추론 경로는 assistant 자리에 VLM 이 생성한
+# 텍스트를 넣는다. 즉 학습 때는 정답을 보고 waypoint 를 예측하고, 실차에서는 못 보고
+# 예측한다 — 실차 성능이 오프라인 지표보다 나쁘게 나오는 구조적 원인으로 의심되는
+# 지점이다.
+#   keep = 사전학습과 동일 조건 (재현용 기준선, ours_only.yaml)
+#   drop = assistant 메시지를 빼서 추론 시점과 학습 시점의 조건을 맞춘다 (이 파일)
+#
+# 부수 효과 ★: 전처리 리포트에서 guidance_waypoint 유효율이 56% 로 나왔다(나머지
+# 44% 는 -100 센티넬이 프롬프트에 문자열로 그대로 박힌다 — 윈도우 끝 9초 구간이고,
+# 우리 데이터에서는 도착 직전 구간에 해당). drop 모드는 assistant 메시지가 통째로
+# 빠지므로 이 오염도 함께 사라진다. → 그래서 noleak 이 실질적으로 1차의 본진이다.
+
+# ── 1차 본학습 하이퍼파라미터 (ours_only.yaml 과 완전히 동일) ──
+batch_size: 2
+# 2 로 시작. A5000 24GB 1장, 공유 서버라 batch 64 는 불가능. nvidia-smi 보며
+# 여유 있으면 4 → 8 로 올린다. 진짜 비용은 VLM forward 의 use_cache=True —
+# 샘플당 delayed 이미지 3~4장 × 256 토큰 ≈ 1,000+ 이미지 토큰의 전 레이어 KV
+# 캐시가 메모리에 남는다(실제로 쓰는 건 마지막 레이어뿐인데도).
+accumulate_grad_batches: 8
+# 유효 배치 16. 원본(레포) 64 를 고집하지 않는다 — 샘플 ~1만1천(72 에피소드 →
+# 윈도우 약 288 → 폴더별 5개마다 1개 샘플링 적용 후 실측치) 기준 유효배치보다
+# 스텝 수 확보가 더 중요하다 (epoch 당 약 690 스텝).
+num_workers: 6
+max_epochs: 6
+# 원본(레포 기본) 10. 데이터가 좁아 과적합 방지.
+learning_rate: 5.0e-5
+# ★ 근거(ours_only.yaml 과 동일): 합본 체크포인트 hparams 실측값은
+#   learning_rate=2e-4, max_epochs=10, warmup_steps=1000 — 대규모 데이터로
+#   랜덤 초기화 head 를 처음 학습시킬 때의 값이라 우리 상황(사전학습된 head 를
+#   좁은 단일 태스크 데이터로 미세조정)엔 둘 다 맞지 않는다. 5e-5 로 시작,
+#   train_action_loss 가 초반 수백 스텝에 급등하면 2e-5 로 내릴 것.
+warmup_steps: 200
+val_check_interval: 0.5
+
+# ── 저장 경로 ──
+# ★ ModelCheckpoint dirpath 가 "{save_dir}/action" 으로 experiment_name 과 무관하게
+#   고정된다(train_wrapper.build_trainer, STAGE="action"). ours_only.yaml 과 save_dir
+#   를 공유하면 save_last=True 체크포인트가 서로 덮어써 keep vs drop 비교가
+#   불가능해진다. 반드시 분리할 것.
+save_dir: outputs/checkpoints/noleak
+log_dir: outputs/logs/noleak
+experiment_name: ticvla_noleak
