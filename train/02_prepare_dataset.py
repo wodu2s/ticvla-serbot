@@ -143,6 +143,13 @@ GND_JSON_DIR = GND_ROOT / "GND_json"
 REPORT_PATH = DATA_ROOT / "PREP_REPORT.md"
 INSUFFICIENT_FUTURE_LIST = GND_ROOT / "insufficient_future_samples.txt"
 
+#: target_hidden_start 에서 목표가 보이기 전 프레임을 옮겨두는 곳(삭제하지
+#: 않는다). GND_json 밖이라 _find_samples() 가 글롭하지 않으므로 policy
+#: 데이터셋에서는 자동으로 빠진다. VLM LoRA/verify 용 데이터셋 구성은
+#: 이번 범위 밖 — 여기 옮겨두는 것으로 끝낸다.
+VLM_ONLY_DIR = GND_ROOT / "vlm_only_excluded_frames"
+VLM_ONLY_LIST = GND_ROOT / "vlm_only_excluded.txt"
+
 # ──────────────────────────────────────────────────────────────────────
 # 검수 상수
 # ──────────────────────────────────────────────────────────────────────
@@ -162,11 +169,36 @@ QUAT_NORM_TOL = 0.05
 DECEL_WINDOW_S = 3.0
 DECEL_WINDOW_N = int(DECEL_WINDOW_S * 10)
 
-#: episode.json 필수 필드.
+#: episode.json 필수 필드 (기존 3색 에피소드 전용 — 완화하지 않는다).
 REQUIRED_EPISODE_FIELDS = (
     "layout", "target_color", "target_side", "instruction",
     "success", "final_distance", "notes",
 )
+
+#: episode.json 에 "episode_type" 이 있으면 신규 marker 에피소드로 간주한다.
+#: joystick_colormarker.py 의 EPISODE_TYPES 와 반드시 같은 값이어야 하지만
+#: 여기서 import 하지는 않는다 — 그 모듈은 rclpy/pygame 의존이라 학습
+#: 환경(이 스크립트가 도는 쪽)에 없을 수 있다.
+MARKER_EPISODE_TYPES = (
+    "target_visible", "target_hidden_start", "landmark", "stop_negative",
+)
+
+#: marker 에피소드 episode.json 공통 필수 필드.
+REQUIRED_MARKER_FIELDS = (
+    "schema_version", "episode_type", "instruction", "target_word",
+    "final_stop_label", "success", "notes",
+)
+
+#: episode_type 별 추가 필수 필드.
+REQUIRED_MARKER_FIELDS_EXTRA: dict[str, tuple[str, ...]] = {
+    "landmark": ("landmark_name",),
+    "target_hidden_start": ("target_first_visible_frame",),
+}
+
+#: Action Expert(policy) 데이터셋에서 통째로 제외하는 episode_type.
+#: s01 자체를 돌리지 않는다(raw/ 는 그대로 둔다. VLM LoRA/verify 용
+#: 데이터셋 구성은 이번 범위 밖 — 이름만 VLM_ONLY_LIST 에 남긴다).
+POLICY_EXCLUDED_EPISODE_TYPES = ("stop_negative",)
 
 #: rgb_00000.jpg 처럼 '접두_숫자.확장자' 인지 — policy_data.get_numeric_key 와
 #: 정확히 같은 규칙(stem.split('_', 1)[1] 이 float 로 파싱돼야 한다).
@@ -257,6 +289,12 @@ class EpisodeCheck:
     target_color: str = ""
     layout: Optional[int] = None
     n_frames: int = 0
+    #: None 이면 기존 3색 에피소드. 아니면 MARKER_EPISODE_TYPES 중 하나.
+    episode_type: Optional[str] = None
+    target_first_visible_frame: Optional[int] = None
+    #: target_first_visible_frame 행의 trajectory.csv "time" 값(원점 보정,
+    #: s01 의 "original_timestamp" 와 같은 기준) — target_hidden_start 전용.
+    target_first_visible_time: Optional[float] = None
 
 
 def check_episode(ep_dir: Path) -> EpisodeCheck:
@@ -282,33 +320,61 @@ def check_episode(ep_dir: Path) -> EpisodeCheck:
         chk.ok = False
         return chk
 
-    missing = [f for f in REQUIRED_EPISODE_FIELDS if f not in meta]
-    if missing:
-        chk.fails.append(f"episode.json 필수 필드 없음: {missing}")
-    layout = meta.get("layout")
-    color = str(meta.get("target_color", ""))
-    side = str(meta.get("target_side", ""))
-    instruction = str(meta.get("instruction", ""))
-    chk.instruction = instruction
-    chk.target_color = color
-    chk.layout = layout if isinstance(layout, int) else None
+    episode_type = meta.get("episode_type")
+    if episode_type is not None:
+        # ── marker 에피소드(신규 4종) — 색/layout 검사를 적용하지 않는다 ──
+        chk.episode_type = str(episode_type)
+        if chk.episode_type not in MARKER_EPISODE_TYPES:
+            chk.fails.append(f"episode_type 이상함: {chk.episode_type!r}")
 
-    if color not in TARGET_COLORS:
-        chk.fails.append(f"target_color 이상함: {color!r}")
-    if side not in SIDES:
-        chk.fails.append(f"target_side 이상함: {side!r}")
-    if not isinstance(layout, int) or layout not in (1, 2, 3):
-        chk.fails.append(f"layout 이 1/2/3 정수가 아님: {layout!r}")
+        required = REQUIRED_MARKER_FIELDS + REQUIRED_MARKER_FIELDS_EXTRA.get(
+            chk.episode_type, ())
+        missing = [f for f in required if f not in meta]
+        if missing:
+            chk.fails.append(f"episode.json 필수 필드 없음(marker): {missing}")
 
-    # ── instruction 색 일치 ★ 불일치는 즉시 실패 ──
-    if color in TARGET_COLORS and instruction:
-        mentioned = {c for c in TARGET_COLORS if c in instruction.lower()}
-        if mentioned != {color}:
-            chk.fails.append(
-                f"instruction 색 불일치: target_color={color!r} "
-                f"instruction={instruction!r} (언급된 색={sorted(mentioned)})")
-    elif not instruction:
-        chk.fails.append("instruction 이 비어 있음")
+        instruction = str(meta.get("instruction", ""))
+        chk.instruction = instruction
+        if not instruction:
+            chk.fails.append("instruction 이 비어 있음")
+
+        if chk.episode_type == "target_hidden_start":
+            frame_idx = meta.get("target_first_visible_frame")
+            if not isinstance(frame_idx, int) or frame_idx < 0:
+                chk.fails.append(
+                    "target_first_visible_frame 이 0 이상 정수가 아님: "
+                    f"{frame_idx!r}")
+            else:
+                chk.target_first_visible_frame = frame_idx
+    else:
+        # ── 기존 3색 에피소드 — 검증을 완화하지 않는다 ──
+        missing = [f for f in REQUIRED_EPISODE_FIELDS if f not in meta]
+        if missing:
+            chk.fails.append(f"episode.json 필수 필드 없음: {missing}")
+        layout = meta.get("layout")
+        color = str(meta.get("target_color", ""))
+        side = str(meta.get("target_side", ""))
+        instruction = str(meta.get("instruction", ""))
+        chk.instruction = instruction
+        chk.target_color = color
+        chk.layout = layout if isinstance(layout, int) else None
+
+        if color not in TARGET_COLORS:
+            chk.fails.append(f"target_color 이상함: {color!r}")
+        if side not in SIDES:
+            chk.fails.append(f"target_side 이상함: {side!r}")
+        if not isinstance(layout, int) or layout not in (1, 2, 3):
+            chk.fails.append(f"layout 이 1/2/3 정수가 아님: {layout!r}")
+
+        # ── instruction 색 일치 ★ 불일치는 즉시 실패 ──
+        if color in TARGET_COLORS and instruction:
+            mentioned = {c for c in TARGET_COLORS if c in instruction.lower()}
+            if mentioned != {color}:
+                chk.fails.append(
+                    f"instruction 색 불일치: target_color={color!r} "
+                    f"instruction={instruction!r} (언급된 색={sorted(mentioned)})")
+        elif not instruction:
+            chk.fails.append("instruction 이 비어 있음")
 
     if chk.fails:
         chk.ok = False
@@ -372,6 +438,17 @@ def check_episode(ep_dir: Path) -> EpisodeCheck:
         chk.fails.append(f"trajectory.csv 숫자 파싱 실패: {exc}")
         chk.ok = not chk.fails
         return chk
+
+    if chk.episode_type == "target_hidden_start" and chk.target_first_visible_frame is not None:
+        if chk.target_first_visible_frame >= n_rows:
+            chk.fails.append(
+                f"target_first_visible_frame({chk.target_first_visible_frame}) 이 "
+                f"csv 행 수({n_rows}) 이상 — 기록 중 버튼을 못 누른 것 같다")
+        else:
+            # s01 이 각 프레임 json 에 남기는 "original_timestamp" 와 같은
+            # 기준(에피소드 시작 = 0)으로 맞춘다.
+            chk.target_first_visible_time = float(
+                data["time"][chk.target_first_visible_frame] - data["time"][0])
 
     t = data["time"]
     dt_ms = np.diff(t) * 1000.0
@@ -530,6 +607,58 @@ def apply_instruction_and_cot(window_dirs: list[Path], instruction: str,
                               encoding="utf-8")
                 n_cot_stripped += 1
     return n_instr, n_cot_stripped
+
+
+def exclude_pre_visible_frames(
+    ep_name: str, window_dirs: list[Path], t_visible: float,
+    vlm_only_entries: list[str],
+) -> tuple[int, int]:
+    """target_hidden_start — 목표가 보이기 전 프레임을 policy 데이터셋에서 뺀다.
+
+    ★ window_dirs 는 항상 GND_JSON_DIR(전처리 출력, s01 이 만든 사본) 아래
+    폴더다 — raw/<ep_name>/rgb/ 의 원본 이미지는 이 함수가 글롭조차 하지
+    않는다(아래 "*.json" 필터는 원본 .jpg 를 매칭하지 않는다). 원본 에피소드
+    폴더는 여기서 한 번도 참조되지 않는다.
+
+    프레임을 버리지 않는다 — 전처리 출력 사본만 VLM_ONLY_DIR 로 옮기고
+    vlm_only_entries 에 "에피소드명, episode_type, 사유" 형식으로 한 줄씩
+    기록한다(VLM LoRA/verify 용 데이터셋 구성은 이번 범위 밖). s01 이 각
+    프레임 json 에 "original_timestamp"(윈도우와 무관한, 에피소드 시작
+    기준 절대 초)를 남기므로 그것과 t_visible 을 비교한다 — 윈도우가
+    슬라이딩(2초 간격)으로 겹치더라도 기준이 항상 같다.
+
+    Args:
+        ep_name: 원본 에피소드 이름(raw/<ep_name>, vlm_only_entries 기록용).
+        window_dirs: 이 에피소드가 만든 윈도우 폴더 목록(GND_JSON_DIR 아래,
+            s01 출력 사본 — raw/<ep_name>/rgb/ 가 아니다).
+        t_visible: target_first_visible_frame 에 해당하는 original_timestamp(초).
+        vlm_only_entries: 옮긴 파일을 한 줄씩 append 할 리스트(in-place).
+
+    Returns:
+        (포함 프레임 수, 제외(이동) 프레임 수).
+    """
+    n_included = 0
+    n_excluded = 0
+    for wd in window_dirs:
+        for jf in sorted(wd.glob("*.json")):
+            try:
+                data = json.loads(jf.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                n_included += 1
+                continue
+            orig_ts = data.get("original_timestamp")
+            if isinstance(orig_ts, (int, float)) and orig_ts < t_visible:
+                dest_dir = VLM_ONLY_DIR / wd.name
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(jf), str(dest_dir / jf.name))
+                vlm_only_entries.append(
+                    f"{ep_name}, target_hidden_start, "
+                    f"목표 보이기 전 프레임 제외 ({wd.name}/{jf.name}, "
+                    f"original_timestamp={orig_ts:.3f} < {t_visible:.3f})")
+                n_excluded += 1
+            else:
+                n_included += 1
+    return n_included, n_excluded
 
 
 def run_s03_annotation(json_folder: Path) -> None:
@@ -729,7 +858,12 @@ def build_output_report(gnd_json_dir: Path, raw_root: Path) -> OutputReport:
 def write_report(checks: list[EpisodeCheck], processed: list[str],
                  skipped_existing: list[str], skip_annotation: bool,
                  n_instr_written: int, n_cot_stripped: int,
-                 out: OutputReport) -> None:
+                 out: OutputReport,
+                 policy_excluded: Optional[list[str]] = None,
+                 vlm_only_entries: Optional[list[str]] = None,
+                 episode_type_counts: Optional[dict[str, dict[str, int]]] = None,
+                 length_excluded: Optional[list[tuple[str, str, int]]] = None,
+                 ) -> None:
     """PREP_REPORT.md 를 쓴다.
 
     Args:
@@ -740,7 +874,17 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
         n_instr_written: 이번 실행에서 쓴 instruction 파일 수.
         n_cot_stripped: 이번 실행에서 제거한 "cot" 키 수.
         out: build_output_report() 결과 (GND_json 전체 기준).
+        policy_excluded: stop_negative 등 policy 데이터셋에서 통째로 제외한
+            에피소드 이름 목록.
+        vlm_only_entries: VLM_ONLY_DIR 로 옮긴 프레임/에피소드 기록 목록.
+        episode_type_counts: {episode_type: {"included": n, "excluded": n}}.
+        length_excluded: s01 150프레임 하한으로 윈도우 0개가 된 에피소드
+            (에피소드명, episode_type 또는 색, 남은 프레임 수) 목록.
     """
+    policy_excluded = policy_excluded or []
+    vlm_only_entries = vlm_only_entries or []
+    episode_type_counts = episode_type_counts or {}
+    length_excluded = length_excluded or []
     lines: list[str] = []
     a = lines.append
     a(f"# {DATASET_NAME} 데이터 준비 리포트\n")
@@ -762,7 +906,7 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
     a("")
 
     a("## 입력 검수 — 에피소드별\n")
-    a("| 에피소드 | 판정 | 색 | 실패 사유 | 경고 |")
+    a("| 에피소드 | 판정 | 색/episode_type | 실패 사유 | 경고 |")
     a("|---|---|---|---|---|")
     n_ok = n_fail = 0
     for c in checks:
@@ -773,7 +917,8 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
             n_fail += 1
         fails = "; ".join(c.fails) if c.fails else ""
         warns = "; ".join(c.warns) if c.warns else ""
-        a(f"| {c.name} | {verdict} | {c.target_color or '?'} | {fails} | {warns} |")
+        tag = c.episode_type or c.target_color or "?"
+        a(f"| {c.name} | {verdict} | {tag} | {fails} | {warns} |")
     a("")
     a(f"통과 {n_ok} / 실패(스킵) {n_fail} / 총 {len(checks)}")
     a("")
@@ -781,9 +926,39 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
         a(f"이미 준비돼 있어 재생성을 건너뛴 에피소드(`--force` 로 재생성): "
           f"{', '.join(skipped_existing)}")
         a("")
+    if policy_excluded:
+        a(f"policy(Action Expert) 데이터셋에서 통째로 제외한 에피소드(stop_negative 등): "
+          f"{', '.join(policy_excluded)}")
+        a("")
     a(f"이번 실행에서 s01 을 실제로 돌린 에피소드: {len(processed)}개, "
       f"instruction 파일 {n_instr_written}개 작성.")
     a("")
+
+    if episode_type_counts:
+        a("### marker 에피소드 — episode_type 별 포함/제외 프레임 수\n")
+        a("target_visible/landmark 는 전체 포함, stop_negative 는 전체 제외, "
+          "target_hidden_start 는 target_first_visible_frame 이전 프레임만 제외다.\n")
+        a("| episode_type | 포함 | 제외 |")
+        a("|---|---|---|")
+        for etype, c in episode_type_counts.items():
+            a(f"| {etype} | {c.get('included', 0)} | {c.get('excluded', 0)} |")
+        a("")
+        a(f"제외된 프레임/에피소드는 삭제하지 않고 `{VLM_ONLY_DIR}` 로 옮기거나 "
+          f"(stop_negative 는 raw/ 를 그대로 둔 채) 이름만 `{VLM_ONLY_LIST}` 에 "
+          "남긴다 — VLM LoRA/verify 용 데이터셋 구성은 이번 범위 밖이다.")
+        a("")
+
+    if length_excluded:
+        a("### 길이 부족 제외 (s01 150프레임/15초 하한, 윈도우 0개)\n")
+        a("s01 의 150프레임 하한은 바꾸지 않는다 — 이 표는 그 하한에 걸려 "
+          "윈도우가 하나도 안 나온 에피소드를 모아 보여줄 뿐이다. "
+          "target_hidden_start 는 목표 보이기 전 프레임을 뺀 뒤 남는 "
+          "프레임 수 기준이다.\n")
+        a("| 에피소드 | episode_type | 남은 프레임 수 |")
+        a("|---|---|---|")
+        for name, tag, remaining in length_excluded:
+            a(f"| {name} | {tag} | {remaining} |")
+        a("")
 
     a("## 출력 검수 — 전체 (GND_json 누적 기준, 이번 실행뿐 아니라 전체)\n")
     a(f"- 윈도우 폴더 수: {out.n_window_dirs}")
@@ -855,6 +1030,10 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
         INSUFFICIENT_FUTURE_LIST.parent.mkdir(parents=True, exist_ok=True)
         INSUFFICIENT_FUTURE_LIST.write_text(
             "\n".join(out.insufficient_future_samples), encoding="utf-8")
+
+    if vlm_only_entries:
+        VLM_ONLY_LIST.parent.mkdir(parents=True, exist_ok=True)
+        VLM_ONLY_LIST.write_text("\n".join(vlm_only_entries), encoding="utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -940,11 +1119,42 @@ def main(argv: Optional[list[str]] = None) -> int:
     total_instr = 0
     total_cot_stripped = 0
 
+    policy_excluded: list[str] = []
+    vlm_only_entries: list[str] = []
+    episode_type_counts: dict[str, dict[str, int]] = {}
+    #: s01 의 150프레임/15초 하한 때문에 윈도우가 0개 나온 에피소드.
+    #: (에피소드명, episode_type 또는 색, 남은 프레임 수) — s01 기준 자체는
+    #: 건드리지 않는다, 리포트에 따로 보여주기 위한 집계일 뿐이다.
+    length_excluded: list[tuple[str, str, int]] = []
+
+    def bump(etype: str, key: str, n: int) -> None:
+        d = episode_type_counts.setdefault(etype, {"included": 0, "excluded": 0})
+        d[key] += n
+
     with tempfile.TemporaryDirectory(prefix="ticvla_s01_patched_") as td:
         patched_s01 = make_patched_s01(Path(td))
         print(f"  (s01 임시 사본: {patched_s01}, 원본은 건드리지 않음)")
 
         for chk in passing:
+            episode_type = chk.episode_type  # None 이면 기존 3색 에피소드
+
+            if episode_type in POLICY_EXCLUDED_EPISODE_TYPES:
+                # stop_negative 등 — policy(Action Expert) 데이터셋에서
+                # 통째로 제외한다. s01 자체를 돌리지 않는다(raw/ 는 그대로
+                # 둔다 — 버리지 않는다). 이름만 목록에 남긴다.
+                existing = sorted(GND_JSON_DIR.glob(f"{chk.name}_*s_*s"))
+                if existing and args.force:
+                    for wd in existing:
+                        shutil.rmtree(wd)
+                    print(f"  - {chk.name}: --force, 기존 {len(existing)}개 윈도우 삭제")
+                policy_excluded.append(chk.name)
+                vlm_only_entries.append(
+                    f"{chk.name}, {episode_type}, 에피소드 전체 제외 (s01 미실행)")
+                bump(episode_type, "excluded", chk.n_frames)
+                print(f"  - {chk.name}: episode_type={episode_type} — "
+                      "policy 데이터셋에서 전체 제외 (s01 미실행)")
+                continue
+
             existing = sorted(GND_JSON_DIR.glob(f"{chk.name}_*s_*s"))
             if existing and not args.force:
                 print(f"  - {chk.name}: 이미 준비됨 ({len(existing)}개 윈도우) — 건너뜀")
@@ -966,8 +1176,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             window_dirs = sorted(GND_JSON_DIR.glob(f"{chk.name}_*s_*s"))
             if not window_dirs:
+                # 길이 부족 제외 집계용 "남은 프레임 수" — s01 의 150프레임
+                # 하한 자체는 바꾸지 않는다, 리포트 표시만 target_hidden_start
+                # 는 목표 보이기 전 프레임을 뺀 수로 보여준다(요청사항).
+                remaining = chk.n_frames
+                if (episode_type == "target_hidden_start"
+                        and chk.target_first_visible_frame is not None):
+                    remaining = max(chk.n_frames - chk.target_first_visible_frame, 0)
+                length_excluded.append(
+                    (chk.name, episode_type or (chk.target_color or "?"), remaining))
                 print(f"  ✗ {chk.name}: s01 이 윈도우를 하나도 만들지 않음 (에피소드가 "
-                      "너무 짧을 수 있다: 최소 150프레임/15초 필요) — 스킵")
+                      "너무 짧을 수 있다: 최소 150프레임/15초 필요) — 스킵"
+                      f" (남은 프레임 {remaining})")
                 chk.ok = False
                 chk.fails.append("s01 산출 윈도우 0개 (에피소드 길이 부족)")
                 continue
@@ -976,9 +1196,26 @@ def main(argv: Optional[list[str]] = None) -> int:
                 window_dirs, chk.instruction, args.skip_annotation)
             total_instr += n_instr
             total_cot_stripped += n_cot
+
+            if episode_type == "target_hidden_start" and chk.target_first_visible_time is not None:
+                n_incl, n_excl = exclude_pre_visible_frames(
+                    chk.name, window_dirs, chk.target_first_visible_time, vlm_only_entries)
+                bump(episode_type, "included", n_incl)
+                bump(episode_type, "excluded", n_excl)
+                print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
+                      f"instruction {n_instr}개 작성, target_hidden_start 프레임 "
+                      f"포함 {n_incl} / 제외(목표 보이기 전) {n_excl}")
+            elif episode_type is not None:
+                # target_visible / landmark — 전체 포함.
+                n_here = sum(len(list(wd.glob("*.json"))) for wd in window_dirs)
+                bump(episode_type, "included", n_here)
+                print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
+                      f"instruction {n_instr}개 작성 (episode_type={episode_type}, 전체 포함)")
+            else:
+                print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
+                      f"instruction {n_instr}개 작성")
+
             processed.append(chk.name)
-            print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
-                  f"instruction {n_instr}개 작성")
 
     # ── 3) 어노테이션(옵션) ──
     if not args.skip_annotation:
@@ -991,7 +1228,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("\n[4/4] 출력 검수 중...")
     out = build_output_report(GND_JSON_DIR, RAW_ROOT)
     write_report(checks, processed, skipped_existing, args.skip_annotation,
-                total_instr, total_cot_stripped, out)
+                total_instr, total_cot_stripped, out,
+                policy_excluded=policy_excluded,
+                vlm_only_entries=vlm_only_entries,
+                episode_type_counts=episode_type_counts,
+                length_excluded=length_excluded)
 
     print(f"\n윈도우 폴더 {out.n_window_dirs}개, json {out.n_json_total}개, "
           f"실제 학습 샘플 {out.n_training_samples}개")

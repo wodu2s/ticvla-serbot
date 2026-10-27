@@ -79,6 +79,28 @@ critical object 로 지목됐고, marker 는 파랑에서 2회 모두 장애물�
 분류돼 실패했다. 모델이 자발적으로 쓰는 명사라 내부 표현과 맞는 것으로
 보인다. marker/point/box 로 바꾸지 말 것.
 
+marker 에피소드 (신규, --episode-type)
+--------------------------------------
+위 3색 cooler 지시문과는 별개로, VLM LoRA/verify 용 부정·랜드마크 예시를
+모으기 위한 4종 에피소드를 --episode-type 으로 선택할 수 있다(생략하면
+기존 동작 그대로 — 대시보드가 배치/목표색을 주입해야 시작 가능하다):
+
+    target_visible        "Go to the <TARGET_WORD>." 목표가 보이는 상태로 주행
+    target_hidden_start   동일 지시문, 목표가 안 보이는 방향에서 시작 —
+                          TARGET_FIRST_VISIBLE_BUTTON(5번)으로 처음 보인
+                          프레임을 표시한다
+    landmark              "Go to the <--landmark-name>." (허용 목록만,
+                          자유 입력 금지: LANDMARKS)
+    stop_negative         "Go to the <TARGET_WORD>." 목표가 아닌 것 앞에서
+                          정지. --stop-target 으로 대상명을 기록한다
+                          (허용 목록 STOP_TARGETS 또는 'other:<이름>')
+
+--episode-type 이 주어지면 이 프로세스가 도는 동안 layout/target_color 는
+쓰지 않고, 대시보드의 /collect/set_config 게이트를 거치지 않는다 — 그
+서비스/대시보드 자체는 건드리지 않는다, 이 스크립트가 그 값을 더 이상
+요구하지 않을 뿐이다. target_color 와 섞이지 않도록 marker 지시문에는
+색 단어를 절대 넣지 않는다.
+
 안전장치 (joystick_errand.py 와 동일한 철학)
 --------------------------------------------
 - 시작 시 /wheel/odom·카메라 미수신 → 에러 종료(10/11), 프로세스 전체 중단.
@@ -120,6 +142,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -176,6 +199,27 @@ INSTRUCTIONS: dict[str, str] = {
     "blue": "Go to the blue cooler.",
 }
 
+#: marker 에피소드(신규 4종)의 목표 단어. 여기 한 곳에서만 관리한다 —
+#: 코드 곳곳에 "marker" 를 하드코딩하지 말 것.
+TARGET_WORD = "marker"
+
+#: marker 에피소드 episode.json 스키마 버전.
+SCHEMA_VERSION = 1
+
+#: 신규 에피소드 종류. CLI --episode-type 의 choices 로 그대로 쓴다.
+EPISODE_TYPES: tuple[str, ...] = (
+    "target_visible", "target_hidden_start", "landmark", "stop_negative",
+)
+
+#: landmark 허용 목록 (자유 입력 금지). 기존 설정 관행(모듈 상수)을 따른다 —
+#: 이 레포에 landmark 이름을 위한 선례가 따로 없어, INSTRUCTIONS 와 같은
+#: 자리에 Python 상수로 둔다.
+LANDMARKS: tuple[str, ...] = ("door", "desk", "shelf", "chair", "wall")
+
+#: stop_negative 의 --stop-target 허용 목록. 이 목록에 없으면
+#: 'other:<이름>' 형식만 허용한다(자유 입력 완전 금지는 아님).
+STOP_TARGETS: tuple[str, ...] = ("wall", "door", "desk", "shelf", "chair")
+
 #: 화면 표시용 한글 색 이름 (내부 값은 계속 영문 "red"/"green"/"blue").
 COLOR_KO: dict[str, str] = {"red": "빨강", "green": "초록", "blue": "파랑"}
 
@@ -198,6 +242,12 @@ STATE_AWAITING_RESULT = "awaiting_result"
 #: 비게 된 구 red_button(1) 슬롯을 재사용한다 — 예약 버튼(0,2,3,4,6,7,8,9)과
 #: 겹치지 않는다.
 EMERGENCY_SUBMIT_BUTTON = 1
+
+#: target_hidden_start 전용 — "목표(marker) 처음 보임" 시점 표시 버튼.
+#: joystick_gotoobject.py/joystick_errand.py/joystick_colormarker.py 어느
+#: 스크립트에서도 쓰지 않는, 진짜 비어 있는 번호임을 확인하고 골랐다.
+#: --episode-type target_hidden_start 일 때만 바인딩된다(다른 모드에선 무시).
+TARGET_FIRST_VISIBLE_BUTTON = 5
 
 #: 비상 제출 시 쓰는 최종거리 기본값. "0.8m 에서 정지"라는 수집 절차의 정지
 #: 기준값과 맞춘다 — 실제로 그 근처에서 멈췄을 것이라는 가정.
@@ -288,6 +338,42 @@ def derive_target_side(layout: int, target_color: str) -> str:
     raise ValueError(f"알 수 없는 target_color: {target_color!r}")
 
 
+def build_marker_instruction(episode_type: str, landmark_name: Optional[str]) -> str:
+    """marker 에피소드 지시문을 만든다. 색 단어를 절대 넣지 않는다.
+
+    Args:
+        episode_type: EPISODE_TYPES 중 하나.
+        landmark_name: episode_type == "landmark" 일 때만 쓰인다.
+
+    Returns:
+        "Go to the <명사>." 형식의 지시문.
+    """
+    if episode_type == "landmark":
+        return f"Go to the {landmark_name}."
+    return f"Go to the {TARGET_WORD}."
+
+
+def marker_final_stop_label(episode_type: str, landmark_name: Optional[str],
+                            stop_target: Optional[str]) -> Optional[str]:
+    """final_stop_label 값을 episode_type 규칙대로 결정한다.
+
+    Args:
+        episode_type: EPISODE_TYPES 중 하나.
+        landmark_name: "landmark" 일 때 쓰인다.
+        stop_target: "stop_negative" 일 때 쓰인다.
+
+    Returns:
+        final_stop_label 값("target" | landmark_name | stop_target).
+    """
+    if episode_type in ("target_visible", "target_hidden_start"):
+        return "target"
+    if episode_type == "landmark":
+        return landmark_name
+    if episode_type == "stop_negative":
+        return stop_target
+    raise ValueError(f"알 수 없는 episode_type: {episode_type!r}")
+
+
 def write_json_atomic(path: Path, payload: dict) -> None:
     """json 을 임시 파일에 쓴 뒤 replace 한다 (Ctrl+C 중 손상 방지).
 
@@ -360,7 +446,10 @@ def default_root() -> str:
 @dataclass
 class Config:
     """실행 설정. 배치/목표색은 여기 없다 — 대시보드가 서비스로 넣는
-    런타임 상태(ColorMarkerRecorder.layout/target_color)다."""
+    런타임 상태(ColorMarkerRecorder.layout/target_color)다.
+
+    episode_type 이하 4개 필드는 신규 marker 에피소드 전용 CLI 설정이다.
+    episode_type 이 None(기본값)이면 기존 동작과 완전히 동일하다."""
 
     root: Path
     target_per_color: int
@@ -372,17 +461,32 @@ class Config:
     sensor_timeout: float
     odom_stall_sec: float
     camera_stall_sec: float
+    episode_type: Optional[str] = None
+    landmark_name: Optional[str] = None
+    stop_target: Optional[str] = None
+    operator_note: str = ""
 
 
 @dataclass
 class Episode:
-    """에피소드 하나(마커 1개 방문)의 기록 상태."""
+    """에피소드 하나(마커 1개 방문)의 기록 상태.
+
+    layout/target_color 는 기존 3색 에피소드 전용, episode_type 이하
+    필드는 신규 marker 에피소드 전용이다 — 한 에피소드는 둘 중 한 쪽만
+    채운다(marker 에피소드는 layout=target_color=None).
+    """
 
     seq: int
-    layout: int
-    target_color: str
+    layout: Optional[int]
+    target_color: Optional[str]
     dir_path: Path
     t0_mono: float
+    episode_type: Optional[str] = None
+    landmark_name: Optional[str] = None
+    instruction: str = ""
+    final_stop_label: Optional[str] = None
+    target_first_visible_frame: Optional[int] = None
+    created_at: str = ""
     frames: int = 0
     stall_ticks: int = 0
     status: str = "recording"
@@ -580,6 +684,24 @@ class ColorMarkerRecorder(Node):
         with self._state_lock:
             self._add_event(self.current, "emergency_stop")
 
+    def mark_target_first_visible(self) -> Optional[int]:
+        """target_hidden_start 전용 — 현재 프레임 인덱스를 처음 보인 시점으로 기록한다.
+
+        target_hidden_start 로 기록 중이 아니면 아무 것도 하지 않는다(무시).
+        이미 기록돼 있으면 덮어쓰지 않는다 — 최초 1회 누름만 유효하다.
+
+        Returns:
+            기록된(또는 이미 기록돼 있던) 프레임 인덱스. 기록 대상이 없으면 None.
+        """
+        with self._state_lock:
+            ep = self.current
+            if ep is None or ep.episode_type != "target_hidden_start":
+                return None
+            if ep.target_first_visible_frame is None:
+                ep.target_first_visible_frame = ep.frames
+                self._add_event(ep, "target_first_visible")
+            return ep.target_first_visible_frame
+
     # ── 이벤트 ───────────────────────────────────────────────────
     def _add_event(self, ep: Optional[Episode], kind: str,
                    mono: Optional[float] = None) -> None:
@@ -612,22 +734,30 @@ class ColorMarkerRecorder(Node):
     def _cmd_start(self, mono: float) -> None:
         """조건이 갖춰져 있으면 새 에피소드 폴더를 만들고 기록을 시작한다.
 
-        배치/목표색은 더 이상 조이스틱이 아니라 /collect/set_config 로
-        들어온다 — 여기서는 이미 설정돼 있는지와 state/센서 상태만 본다.
+        배치/목표색 모드(cfg.episode_type 이 None): 더 이상 조이스틱이
+        아니라 /collect/set_config 로 들어온다 — 여기서는 이미 설정돼
+        있는지와 state/센서 상태만 본다.
+        marker 모드(cfg.episode_type 이 설정된 경우): --episode-type 이
+        프로세스 전체에 고정된 CLI 값이므로 대시보드 설정을 기다리지 않는다.
 
         Args:
             mono: 요청 시각(monotonic).
         """
+        cfg = self.cfg
+        marker_mode = cfg.episode_type is not None
+        layout: Optional[int] = None
+        target_color: Optional[str] = None
         with self._state_lock:
             if self.state != STATE_IDLE:
                 self._reject_start(f"state={self.state} (idle 이 아니다)")
                 return
-            if self.layout is None or self.target_color is None:
-                self._reject_start(
-                    "배치/목표색이 설정돼 있지 않다 — 대시보드(/collect)에서 설정할 것")
-                return
-            layout = self.layout
-            target_color = self.target_color
+            if not marker_mode:
+                if self.layout is None or self.target_color is None:
+                    self._reject_start(
+                        "배치/목표색이 설정돼 있지 않다 — 대시보드(/collect)에서 설정할 것")
+                    return
+                layout = self.layout
+                target_color = self.target_color
 
         if not self.odom_fresh():
             self._reject_start(f"{self.cfg.odom_topic} 미수신")
@@ -636,21 +766,36 @@ class ColorMarkerRecorder(Node):
             self._reject_start(f"{self.cfg.camera_topic} 미수신")
             return
 
-        cfg = self.cfg
         seq = next_episode_seq(cfg.root)
-        name = f"ep{seq:04d}_L{layout}_{target_color}"
+        if marker_mode:
+            name = f"ep{seq:04d}_M_{cfg.episode_type}"
+        else:
+            name = f"ep{seq:04d}_L{layout}_{target_color}"
         ep_dir = cfg.root / name
         while ep_dir.exists():
             seq += 1
-            name = f"ep{seq:04d}_L{layout}_{target_color}"
+            name = (f"ep{seq:04d}_M_{cfg.episode_type}" if marker_mode
+                    else f"ep{seq:04d}_L{layout}_{target_color}")
             ep_dir = cfg.root / name
         ep_dir.mkdir(parents=True, exist_ok=False)
         (ep_dir / "rgb").mkdir()
 
-        ep = Episode(
-            seq=seq, layout=layout,
-            target_color=target_color, dir_path=ep_dir, t0_mono=mono,
-        )
+        if marker_mode:
+            ep = Episode(
+                seq=seq, layout=None, target_color=None, dir_path=ep_dir,
+                t0_mono=mono, episode_type=cfg.episode_type,
+                landmark_name=cfg.landmark_name,
+                instruction=build_marker_instruction(
+                    cfg.episode_type, cfg.landmark_name),
+                final_stop_label=marker_final_stop_label(
+                    cfg.episode_type, cfg.landmark_name, cfg.stop_target),
+                created_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        else:
+            ep = Episode(
+                seq=seq, layout=layout,
+                target_color=target_color, dir_path=ep_dir, t0_mono=mono,
+            )
         ep._fh = ep.csv_path.open("w", encoding="utf-8", newline="")
         ep._writer = csv.writer(ep._fh)
         ep._writer.writerow(TRAJECTORY_HEADER)
@@ -661,9 +806,14 @@ class ColorMarkerRecorder(Node):
             self.state = STATE_RECORDING
         self._add_event(ep, "episode_start")
         self._write_provisional_episode_json(ep)
-        self.log.info(
-            f"에피소드 시작 {name} target_side="
-            f"{derive_target_side(layout, target_color)}")
+        if marker_mode:
+            self.log.info(
+                f"에피소드 시작 {name} episode_type={cfg.episode_type} "
+                f"instruction={ep.instruction!r}")
+        else:
+            self.log.info(
+                f"에피소드 시작 {name} target_side="
+                f"{derive_target_side(layout, target_color)}")
 
     def _write_provisional_episode_json(self, ep: Episode) -> None:
         """기록 중/중단 시점의 잠정 episode.json (수기 필드는 아직 비움).
@@ -671,22 +821,44 @@ class ColorMarkerRecorder(Node):
         Args:
             ep: 대상 에피소드.
         """
-        payload = {
-            "dataset": DATASET_NAME,
-            "layout": ep.layout,
-            "target_color": ep.target_color,
-            "target_side": derive_target_side(ep.layout, ep.target_color),
-            "instruction": INSTRUCTIONS[ep.target_color],
-            "start_distance_approx": None,
-            "success": None,
-            "final_distance": None,
-            "notes": "",
-            "status": ep.status,
-            "hz": self.cfg.hz,
-            "num_frames": ep.frames,
-            "num_csv_rows": count_csv_rows(ep.csv_path),
-            "stall_ticks": ep.stall_ticks,
-        }
+        if ep.episode_type is not None:
+            payload = {
+                "dataset": DATASET_NAME,
+                "schema_version": SCHEMA_VERSION,
+                "episode_type": ep.episode_type,
+                "instruction": ep.instruction,
+                "target_word": TARGET_WORD,
+                "landmark_name": ep.landmark_name,
+                "target_first_visible_frame": ep.target_first_visible_frame,
+                "final_stop_label": ep.final_stop_label,
+                "operator_note": self.cfg.operator_note,
+                "timestamp": ep.created_at,
+                "success": None,
+                "final_distance": None,
+                "notes": "",
+                "status": ep.status,
+                "hz": self.cfg.hz,
+                "num_frames": ep.frames,
+                "num_csv_rows": count_csv_rows(ep.csv_path),
+                "stall_ticks": ep.stall_ticks,
+            }
+        else:
+            payload = {
+                "dataset": DATASET_NAME,
+                "layout": ep.layout,
+                "target_color": ep.target_color,
+                "target_side": derive_target_side(ep.layout, ep.target_color),
+                "instruction": INSTRUCTIONS[ep.target_color],
+                "start_distance_approx": None,
+                "success": None,
+                "final_distance": None,
+                "notes": "",
+                "status": ep.status,
+                "hz": self.cfg.hz,
+                "num_frames": ep.frames,
+                "num_csv_rows": count_csv_rows(ep.csv_path),
+                "stall_ticks": ep.stall_ticks,
+            }
         try:
             write_json_atomic(ep.json_path, payload)
         except Exception as exc:  # noqa: BLE001
@@ -1099,6 +1271,18 @@ def build_button_map(cfg: Config) -> tuple[dict[int, str], dict[int, str]]:
         jg.COLLECT_STOP_BUTTON: "★ 에피소드 종료 (즉시 — 결과는 대시보드에서 입력)",
         EMERGENCY_SUBMIT_BUTTON: "대시보드 다운 비상구 — 결과대기 중 '성공'으로 즉시 제출",
     }
+
+    if cfg.episode_type == "target_hidden_start":
+        if (TARGET_FIRST_VISIBLE_BUTTON in reserved
+                or TARGET_FIRST_VISIBLE_BUTTON == EMERGENCY_SUBMIT_BUTTON):
+            raise SystemExit(
+                "내부 오류: TARGET_FIRST_VISIBLE_BUTTON="
+                f"{TARGET_FIRST_VISIBLE_BUTTON} 이 예약 버튼과 겹친다 — "
+                "코드에서 상수를 바꿔야 한다.")
+        action[TARGET_FIRST_VISIBLE_BUTTON] = "mark_target_visible"
+        desc[TARGET_FIRST_VISIBLE_BUTTON] = (
+            "★ target_hidden_start 전용 — 목표(marker) 처음 보임 표시")
+
     return action, desc
 
 
@@ -1127,6 +1311,11 @@ def handle_button(rec: ColorMarkerRecorder, act: str, button: int) -> str:
     if act == "emergency_submit":
         ok, reason = rec.emergency_submit()
         return f"버튼 {button}: {'비상 성공 제출 완료' if ok else '비상 제출 무시'} — {reason}"
+    if act == "mark_target_visible":
+        frame = rec.mark_target_first_visible()
+        if frame is None:
+            return f"버튼 {button}: 무시됨 (target_hidden_start 기록 중이 아니다)"
+        return f"버튼 {button}: target_first_visible_frame={frame} 기록"
     return f"버튼 {button}"
 
 
@@ -1259,6 +1448,8 @@ def checklist_lines(rec: ColorMarkerRecorder) -> list[str]:
     fresh = rec.odom_fresh()
     odom_box = "☑" if fresh else "☐"
     odom_tail = "" if fresh else " ← 미수신! 'bot'/'botcheck' 로 확인할 것"
+    if rec.cfg.episode_type is not None:
+        return [f"  {odom_box} odom 수신{odom_tail}"]
     return [
         "  □ 3색 모두 보임",
         f"  {odom_box} odom 수신{odom_tail}",
@@ -1306,16 +1497,23 @@ def print_status(cfg: Config, rec: ColorMarkerRecorder,
     print(f"╔{frame}╗")
     print(f"■ TIC-VLA 3색 마커 수집 | {joystick.get_name()} | "
           f"SerBOT {'실제' if jg.SERBOT_AVAILABLE else '더미'}({jg.bot.name})")
-    print(f"  state: {state}"
-          + (f"  |  배치 {layout} — {layout_desc(layout, ko=True)}"
-             if layout is not None else "  |  배치 (미설정 — 대시보드에서 설정)"))
+    if cfg.episode_type is not None:
+        print(f"  state: {state}  |  marker 모드: episode_type={cfg.episode_type}")
+    else:
+        print(f"  state: {state}"
+              + (f"  |  배치 {layout} — {layout_desc(layout, ko=True)}"
+                 if layout is not None else "  |  배치 (미설정 — 대시보드에서 설정)"))
     print(f"  스틱 x={x_pos:+.2f} y={y_pos:+.2f} z={z_pos:+.2f} "
           f"→ cmd_vel vx={lx:+.2f} vy={ly:+.2f} wz={az:+.2f} → {cfg.cmd_vel_topic}")
 
-    print(f"  목표색: {target_color or '(미설정 — 대시보드에서 설정)'}")
-    if layout is not None and target_color:
-        side = derive_target_side(layout, target_color)
-        print(f"  target_side: {side}  |  instruction: {INSTRUCTIONS[target_color]!r}")
+    if cfg.episode_type is not None:
+        print(f"  instruction: "
+              f"{build_marker_instruction(cfg.episode_type, cfg.landmark_name)!r}")
+    else:
+        print(f"  목표색: {target_color or '(미설정 — 대시보드에서 설정)'}")
+        if layout is not None and target_color:
+            side = derive_target_side(layout, target_color)
+            print(f"  target_side: {side}  |  instruction: {INSTRUCTIONS[target_color]!r}")
     print("  체크: " + "   ".join(line.strip() for line in checklist_lines(rec)))
 
     if ep is not None:
@@ -1329,11 +1527,14 @@ def print_status(cfg: Config, rec: ColorMarkerRecorder,
     else:
         print("  [대기 중] — 대시보드에서 배치/목표색 설정 후 8번으로 시작하세요"
               + (f"  ← 직전 시작 거부: {rejection[1]}" if rejection is not None else ""))
-    counts = (scan_counts(cfg.root, layout) if layout is not None
-             else {c: 0 for c in TARGET_COLORS})
-    print_counts_table(counts, cfg, layout)
+    if cfg.episode_type is None:
+        counts = (scan_counts(cfg.root, layout) if layout is not None
+                 else {c: 0 for c in TARGET_COLORS})
+        print_counts_table(counts, cfg, layout)
 
     footer = f"  8=시작  9=종료  0=긴급정지  {EMERGENCY_SUBMIT_BUTTON}=결과 비상제출(성공)"
+    if cfg.episode_type == "target_hidden_start":
+        footer += f"  {TARGET_FIRST_VISIBLE_BUTTON}=목표 첫 확인"
     if notice:
         footer += f"  |  알림: {notice}"
     print(footer)
@@ -1358,23 +1559,46 @@ def finalize_episode_json(ep: Episode, success: Optional[bool],
         notes: 메모.
         cfg: 실행 설정.
     """
-    payload = {
-        "dataset": DATASET_NAME,
-        "layout": ep.layout,
-        "target_color": ep.target_color,
-        "target_side": derive_target_side(ep.layout, ep.target_color),
-        "instruction": INSTRUCTIONS[ep.target_color],
-        "start_distance_approx": start_distance_approx,
-        "success": success,
-        "final_distance": final_distance,
-        "notes": notes,
-        "status": ep.status,
-        "hz": cfg.hz,
-        "num_frames": ep.frames,
-        "num_csv_rows": count_csv_rows(ep.csv_path),
-        "stall_ticks": ep.stall_ticks,
-        "warnings": list(ep.warnings),
-    }
+    if ep.episode_type is not None:
+        payload = {
+            "dataset": DATASET_NAME,
+            "schema_version": SCHEMA_VERSION,
+            "episode_type": ep.episode_type,
+            "instruction": ep.instruction,
+            "target_word": TARGET_WORD,
+            "landmark_name": ep.landmark_name,
+            "target_first_visible_frame": ep.target_first_visible_frame,
+            "final_stop_label": ep.final_stop_label,
+            "operator_note": cfg.operator_note,
+            "timestamp": ep.created_at,
+            "success": success,
+            "final_distance": final_distance,
+            "notes": notes,
+            "status": ep.status,
+            "hz": cfg.hz,
+            "num_frames": ep.frames,
+            "num_csv_rows": count_csv_rows(ep.csv_path),
+            "stall_ticks": ep.stall_ticks,
+            "warnings": list(ep.warnings),
+        }
+    else:
+        payload = {
+            "dataset": DATASET_NAME,
+            "layout": ep.layout,
+            "target_color": ep.target_color,
+            "target_side": derive_target_side(ep.layout, ep.target_color),
+            "instruction": INSTRUCTIONS[ep.target_color],
+            "start_distance_approx": start_distance_approx,
+            "success": success,
+            "final_distance": final_distance,
+            "notes": notes,
+            "status": ep.status,
+            "hz": cfg.hz,
+            "num_frames": ep.frames,
+            "num_csv_rows": count_csv_rows(ep.csv_path),
+            "stall_ticks": ep.stall_ticks,
+            "warnings": list(ep.warnings),
+        }
     write_json_atomic(ep.json_path, payload)
 
 
@@ -1402,17 +1626,25 @@ def run_verify(ep: Episode) -> int:
         return 2
     tmp = Path(tempfile.mkdtemp(prefix="colormarker_verify_"))
     try:
-        seg_link = tmp / f"seg00_{ep.target_color}"
+        if ep.episode_type is not None:
+            object_tag = re.sub(
+                r"[^a-zA-Z0-9]+", "_", str(ep.final_stop_label or ep.episode_type))
+            instruction = ep.instruction
+            scenario = ep.episode_type
+        else:
+            object_tag = ep.target_color
+            instruction = INSTRUCTIONS[ep.target_color]
+            scenario = f"L{ep.layout}_{ep.target_color}"
+        seg_link = tmp / f"seg00_{object_tag}"
         seg_link.symlink_to(ep.dir_path.resolve(), target_is_directory=True)
-        instruction = INSTRUCTIONS[ep.target_color]
         session_payload = {
             "dataset": DATASET_NAME,
             "session_id": ep.name,
-            "scenario": f"L{ep.layout}_{ep.target_color}",
+            "scenario": scenario,
             "hz": SAVE_HZ,
             "status": "completed" if ep.status == "done" else ep.status,
             "segment_plan": [
-                {"index": 0, "object": ep.target_color, "instruction": instruction},
+                {"index": 0, "object": object_tag, "instruction": instruction},
             ],
             "events": list(ep.events),
             "warnings": list(ep.warnings),
@@ -1471,6 +1703,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="이 시간 동안 odom 이 안 오면 에피소드 중단")
     parser.add_argument("--camera-stall-sec", type=float, default=0.5,
                         help="이 시간 동안 새 프레임이 안 오면 에피소드 중단")
+    parser.add_argument(
+        "--episode-type", choices=EPISODE_TYPES, default=None,
+        help="신규 marker 에피소드 종류. 생략하면 기존 동작 그대로"
+             "(대시보드가 /collect/set_config 로 배치/목표색을 주입해야 시작 가능)")
+    parser.add_argument(
+        "--landmark-name", choices=LANDMARKS, default=None,
+        help="--episode-type landmark 일 때 필수. 자유 입력 불가(허용 목록만)")
+    parser.add_argument(
+        "--stop-target", default=None,
+        help="--episode-type stop_negative 일 때 필수. "
+             f"허용 목록({', '.join(STOP_TARGETS)}) 또는 'other:<이름>'")
+    parser.add_argument(
+        "--operator-note", default="",
+        help="episode.json 의 operator_note 에 그대로 남길 비고")
     return parser.parse_args(argv)
 
 
@@ -1503,6 +1749,44 @@ def build_config(args: argparse.Namespace) -> Config:
             "데이터셋이어야 한다. --root 를 확인할 것.")
     root.mkdir(parents=True, exist_ok=True)
 
+    episode_type = args.episode_type
+    landmark_name = args.landmark_name
+    stop_target = args.stop_target
+    if episode_type == "landmark":
+        if landmark_name is None:
+            raise SystemExit(
+                "ERROR: --episode-type landmark 는 --landmark-name 이 필수다 "
+                f"(허용: {', '.join(LANDMARKS)})")
+        if stop_target is not None:
+            raise SystemExit(
+                "ERROR: --episode-type landmark 에는 --stop-target 을 줄 수 없다")
+    elif episode_type == "stop_negative":
+        if stop_target is None:
+            raise SystemExit(
+                "ERROR: --episode-type stop_negative 는 --stop-target 이 필수다 "
+                f"(허용: {', '.join(STOP_TARGETS)} 또는 'other:<이름>')")
+        if landmark_name is not None:
+            raise SystemExit(
+                "ERROR: --episode-type stop_negative 에는 --landmark-name 을 줄 수 없다")
+        if stop_target not in STOP_TARGETS:
+            if not stop_target.startswith("other:") or len(stop_target) <= len("other:"):
+                raise SystemExit(
+                    "ERROR: --stop-target 은 "
+                    f"{', '.join(STOP_TARGETS)} 중 하나이거나 'other:<이름>' 형식이어야 "
+                    f"한다 (받은 값 {stop_target!r})")
+    elif episode_type in ("target_visible", "target_hidden_start"):
+        if landmark_name is not None:
+            raise SystemExit(
+                f"ERROR: --episode-type {episode_type} 에는 --landmark-name 을 줄 수 없다")
+        if stop_target is not None:
+            raise SystemExit(
+                f"ERROR: --episode-type {episode_type} 에는 --stop-target 을 줄 수 없다")
+    else:
+        if landmark_name is not None or stop_target is not None:
+            raise SystemExit(
+                "ERROR: --landmark-name / --stop-target 은 --episode-type 이 "
+                "설정된 경우에만 쓸 수 있다")
+
     return Config(
         root=root,
         target_per_color=int(args.target_per_color),
@@ -1514,6 +1798,10 @@ def build_config(args: argparse.Namespace) -> Config:
         sensor_timeout=float(args.sensor_timeout),
         odom_stall_sec=float(args.odom_stall_sec),
         camera_stall_sec=float(args.camera_stall_sec),
+        episode_type=episode_type,
+        landmark_name=landmark_name,
+        stop_target=stop_target,
+        operator_note=str(args.operator_note),
     )
 
 
@@ -1581,6 +1869,15 @@ def main(argv: Optional[list[str]] = None) -> int:
           "→ 0.8m 정지 → 9번으로 즉시 종료. 정지 유지 구간 없음.")
     print("[안내] 로봇 시작 위치는 기록하지 않는다 — 매 에피소드 30~50cm "
           "아무렇게나 옮길 것 (같은 그림 반복 방지).")
+    if cfg.episode_type is not None:
+        extra = ""
+        if cfg.landmark_name:
+            extra += f" landmark_name={cfg.landmark_name}"
+        if cfg.stop_target:
+            extra += f" stop_target={cfg.stop_target}"
+        print(f"[설정] marker 에피소드: episode_type={cfg.episode_type} "
+              f"target_word={TARGET_WORD!r}{extra}")
+        print("[설정] 대시보드 배치/목표색 설정 불필요 — 8번으로 바로 시작 가능")
 
     rclpy.init(args=None)
     rec = ColorMarkerRecorder(cfg)
@@ -1603,7 +1900,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         clock = pygame.time.Clock()
         debug_interval = max(1, int(jg.UPDATE_HZ / jg.DEBUG_HZ))
         frame_count = 0
-        notice = "대시보드(/collect)에서 배치/목표색을 설정한 뒤 8번으로 시작하세요"
+        if cfg.episode_type is not None:
+            notice = f"marker 모드({cfg.episode_type}) 준비됨 — 8번으로 시작하세요"
+        else:
+            notice = "대시보드(/collect)에서 배치/목표색을 설정한 뒤 8번으로 시작하세요"
         xyz = (0.0, 0.0, 0.0)
 
         while True:
