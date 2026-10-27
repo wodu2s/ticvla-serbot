@@ -200,6 +200,10 @@ REQUIRED_MARKER_FIELDS_EXTRA: dict[str, tuple[str, ...]] = {
 #: 데이터셋 구성은 이번 범위 밖 — 이름만 VLM_ONLY_LIST 에 남긴다).
 POLICY_EXCLUDED_EPISODE_TYPES = ("stop_negative",)
 
+#: train/generate_instruction_v2.py 가 raw/<ep>/ 아래 추가로 쓰는 사이드카
+#: 파일 이름. 그 스크립트의 SIDECAR_NAME 과 반드시 같은 값이어야 한다.
+INSTRUCTION_V2_SIDECAR_NAME = "instruction_v2.json"
+
 #: rgb_00000.jpg 처럼 '접두_숫자.확장자' 인지 — policy_data.get_numeric_key 와
 #: 정확히 같은 규칙(stem.split('_', 1)[1] 이 float 로 파싱돼야 한다).
 def is_numeric_key_safe(stem: str) -> bool:
@@ -579,6 +583,39 @@ def ensure_meta_json(ep_dir: Path, instruction: str) -> None:
 # instruction / cot 후처리
 # ──────────────────────────────────────────────────────────────────────
 
+def resolve_instruction(ep_dir: Path, instruction: str,
+                        use_instruction_v2: bool) -> tuple[str, bool]:
+    """--use-instruction-v2 가 켜져 있고 사이드카가 있으면 그 값을 쓴다.
+
+    사이드카가 없거나 깨져 있으면(또는 옵션이 꺼져 있으면) 조용히 원본
+    instruction 으로 돌아간다 — 신규 marker 에피소드처럼 애초에 "cooler"가
+    없어 사이드카가 필요 없는 경우와, 아직 generate_instruction_v2.py 를
+    안 돌린 에피소드를 구분하지 않고 둘 다 원본을 쓰는 것이 기존 동작을
+    가장 덜 놀라게 한다.
+
+    Args:
+        ep_dir: raw/<ep_name> 폴더.
+        instruction: episode.json 의 원본 instruction.
+        use_instruction_v2: --use-instruction-v2 여부.
+
+    Returns:
+        (실제로 쓸 instruction, instruction_v2 를 썼는지 여부).
+    """
+    if not use_instruction_v2:
+        return instruction, False
+    sidecar = ep_dir / INSTRUCTION_V2_SIDECAR_NAME
+    if not sidecar.is_file():
+        return instruction, False
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return instruction, False
+    v2 = data.get("instruction_v2")
+    if not isinstance(v2, str) or not v2:
+        return instruction, False
+    return v2, True
+
+
 def apply_instruction_and_cot(window_dirs: list[Path], instruction: str,
                               skip_annotation: bool) -> tuple[int, int]:
     """윈도우 폴더들의 모든 프레임 json 에 instruction 을 쓰고 cot 를 처리한다.
@@ -863,6 +900,8 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
                  vlm_only_entries: Optional[list[str]] = None,
                  episode_type_counts: Optional[dict[str, dict[str, int]]] = None,
                  length_excluded: Optional[list[tuple[str, str, int]]] = None,
+                 n_instruction_v2_used: int = 0,
+                 use_instruction_v2: bool = False,
                  ) -> None:
     """PREP_REPORT.md 를 쓴다.
 
@@ -880,6 +919,9 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
         episode_type_counts: {episode_type: {"included": n, "excluded": n}}.
         length_excluded: s01 150프레임 하한으로 윈도우 0개가 된 에피소드
             (에피소드명, episode_type 또는 색, 남은 프레임 수) 목록.
+        n_instruction_v2_used: --use-instruction-v2 로 실제 instruction_v2 를
+            쓴 에피소드 수.
+        use_instruction_v2: --use-instruction-v2 여부.
     """
     policy_excluded = policy_excluded or []
     vlm_only_entries = vlm_only_entries or []
@@ -891,6 +933,8 @@ def write_report(checks: list[EpisodeCheck], processed: list[str],
     a(f"- raw 루트: `{RAW_ROOT}`")
     a(f"- 출력(GND_json): `{GND_JSON_DIR}`")
     a(f"- 어노테이션(s03/CoT): {'건너뜀 (--skip-annotation)' if skip_annotation else '실행함'}")
+    a(f"- instruction_v2: {'사용 (--use-instruction-v2)' if use_instruction_v2 else '미사용(기본값, episode.json 의 instruction 그대로)'}"
+      + (f" — 이번 실행에서 {n_instruction_v2_used}개 에피소드에 적용" if use_instruction_v2 else ""))
     a("")
 
     a("## 결정 요약 (전체 근거는 스크립트 상단 독스트링)\n")
@@ -1060,6 +1104,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="s03(OpenAI CoT 생성)을 건너뛴다 — 'cot' 키를 제거한다")
     parser.add_argument("--force", action="store_true",
                         help="이미 GND_json 에 결과가 있는 에피소드도 지우고 다시 만든다")
+    parser.add_argument(
+        "--use-instruction-v2", action="store_true",
+        help="raw/<ep>/instruction_v2.json(train/generate_instruction_v2.py 산출물)이 "
+             "있으면 episode.json 의 instruction 대신 그 instruction_v2 를 학습 "
+             "데이터에 쓴다. 생략(기본값)하면 기존 동작 그대로 episode.json 의 "
+             "instruction 만 쓴다 — 사이드카가 없는 에피소드는 켜도 원본 instruction 그대로.")
     return parser.parse_args(argv)
 
 
@@ -1126,6 +1176,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     #: (에피소드명, episode_type 또는 색, 남은 프레임 수) — s01 기준 자체는
     #: 건드리지 않는다, 리포트에 따로 보여주기 위한 집계일 뿐이다.
     length_excluded: list[tuple[str, str, int]] = []
+    n_instruction_v2_used = 0
 
     def bump(etype: str, key: str, n: int) -> None:
         d = episode_type_counts.setdefault(etype, {"included": 0, "excluded": 0})
@@ -1165,7 +1216,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     shutil.rmtree(wd)
                 print(f"  - {chk.name}: --force, 기존 {len(existing)}개 윈도우 삭제 후 재생성")
 
-            ensure_meta_json(chk.ep_dir, chk.instruction)
+            effective_instruction, used_v2 = resolve_instruction(
+                chk.ep_dir, chk.instruction, args.use_instruction_v2)
+            if used_v2:
+                n_instruction_v2_used += 1
+
+            ensure_meta_json(chk.ep_dir, effective_instruction)
             try:
                 run_s01(patched_s01, chk.ep_dir, GND_JSON_DIR)
             except subprocess.CalledProcessError as exc:
@@ -1193,9 +1249,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
 
             n_instr, n_cot = apply_instruction_and_cot(
-                window_dirs, chk.instruction, args.skip_annotation)
+                window_dirs, effective_instruction, args.skip_annotation)
             total_instr += n_instr
             total_cot_stripped += n_cot
+            v2_tag = " [instruction_v2]" if used_v2 else ""
 
             if episode_type == "target_hidden_start" and chk.target_first_visible_time is not None:
                 n_incl, n_excl = exclude_pre_visible_frames(
@@ -1203,17 +1260,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 bump(episode_type, "included", n_incl)
                 bump(episode_type, "excluded", n_excl)
                 print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
-                      f"instruction {n_instr}개 작성, target_hidden_start 프레임 "
+                      f"instruction {n_instr}개 작성{v2_tag}, target_hidden_start 프레임 "
                       f"포함 {n_incl} / 제외(목표 보이기 전) {n_excl}")
             elif episode_type is not None:
                 # target_visible / landmark — 전체 포함.
                 n_here = sum(len(list(wd.glob("*.json"))) for wd in window_dirs)
                 bump(episode_type, "included", n_here)
                 print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
-                      f"instruction {n_instr}개 작성 (episode_type={episode_type}, 전체 포함)")
+                      f"instruction {n_instr}개 작성{v2_tag} (episode_type={episode_type}, 전체 포함)")
             else:
                 print(f"  ✓ {chk.name}: 윈도우 {len(window_dirs)}개, "
-                      f"instruction {n_instr}개 작성")
+                      f"instruction {n_instr}개 작성{v2_tag}")
 
             processed.append(chk.name)
 
@@ -1232,10 +1289,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 policy_excluded=policy_excluded,
                 vlm_only_entries=vlm_only_entries,
                 episode_type_counts=episode_type_counts,
-                length_excluded=length_excluded)
+                length_excluded=length_excluded,
+                n_instruction_v2_used=n_instruction_v2_used,
+                use_instruction_v2=args.use_instruction_v2)
 
     print(f"\n윈도우 폴더 {out.n_window_dirs}개, json {out.n_json_total}개, "
           f"실제 학습 샘플 {out.n_training_samples}개")
+    if args.use_instruction_v2:
+        print(f"instruction_v2 적용 에피소드: {n_instruction_v2_used}개 "
+              f"(--use-instruction-v2, 사이드카 없으면 원본 instruction 사용)")
     print(f"리포트: {REPORT_PATH}")
     return 0
 
