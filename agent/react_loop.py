@@ -16,6 +16,11 @@ TIC-VLA 는 "보이는 목표로 이동"만 할 수 있다. 이 루프는 그 �
     # agent/tic_vla_adapter.py 의 LiveTicVlaAdapter 설명 참고)
     GEMINI_API_KEY=... venvs/ticvla/bin/python3 -m agent.react_loop \\
         --goal "Find the gray bin."
+
+    # ReAct 단독 실주행 (TIC-VLA 없음, Gemini 비전 + cmd_vel — 로봇이 움직인다.
+    # agent/direct_drive_adapter.py 참고. ROS 를 source 한 셸에서.)
+    GEMINI_API_KEY=... venvs/ticvla/bin/python3 -m agent.react_loop \\
+        --direct --config config/react_direct.yaml --goal "Find the red marker."
 """
 from __future__ import annotations
 
@@ -315,6 +320,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help='YAML 설정 파일 경로(기본: config/react_agent.yaml).')
     parser.add_argument('--dry-run', action='store_true',
                         help='TIC-VLA 를 호출하지 않고 표준입력으로 관측을 받는다.')
+    parser.add_argument('--direct', action='store_true',
+                        help='ReAct 단독 실주행: TIC-VLA 없이 Gemini 가 카메라를 직접 보고 '
+                             'cmd_vel 로 로봇을 움직인다(config 의 direct 섹션).')
     return parser.parse_args(argv)
 
 
@@ -342,9 +350,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error(str(exc))
         return 1
 
+    if args.dry_run and args.direct:
+        logger.error('--dry-run 과 --direct 는 같이 쓸 수 없다.')
+        return 1
+
     adapter: TicVlaAdapter
     if args.dry_run:
         adapter = DryRunAdapter()
+    elif args.direct:
+        from agent.direct_drive_adapter import DirectDriveAdapter
+        try:
+            adapter = DirectDriveAdapter(cfg.direct, llm, logger, run_label)
+        except RuntimeError as exc:
+            logger.error(f'direct 어댑터 초기화 실패: {exc}')
+            return 1
+        logger.info(f'스텝별 프레임: {adapter.frame_dir}')
     else:
         try:
             adapter = LiveTicVlaAdapter(cfg.ticvla, logger)
@@ -358,16 +378,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     except EOFError as exc:
         logger.error(str(exc))
         return 1
+    except KeyboardInterrupt:
+        logger.warning('Ctrl+C — 정지하고 종료한다.')
+        adapter.stop()
+        verdict = 'interrupted'
+    except Exception as exc:  # noqa: BLE001 — 실주행 중 예외는 반드시 정지 후 종료
+        # direct 모드의 OperatorAbort(조이스틱/E-Stop 개입) 포함.
+        logger.error(f'루프 중단: {type(exc).__name__}: {exc}')
+        adapter.stop()
+        verdict = 'aborted'
     finally:
+        close = getattr(adapter, 'close', None)
+        if close is not None:
+            close()
         jsonl.close()
 
     logger.info(f'종료 판정: {verdict}')
     # 0=정상(found), 1=알고리즘적 실패(모델이 스스로 fail 했거나 상한 도달),
     # 2=LLM 인프라 장애로 인한 중단 — 로그 집계에서 셋을 구분해야 한다(요구사항 4).
+    # 3=운영자 개입/Ctrl+C/예외로 중단(direct 실주행).
     if verdict == 'found':
         return 0
     if verdict == 'llm_unavailable':
         return 2
+    if verdict in ('interrupted', 'aborted'):
+        return 3
     return 1
 
 

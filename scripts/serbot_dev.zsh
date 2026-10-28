@@ -909,3 +909,99 @@ EOF
     echo "   대시보드: http://${ip}:${SERBOT_DASHBOARD_PORT}/collect"
     return $rc
 }
+
+# ---------------------------------------------------------------------------
+# reactdrive — ReAct 단독 실주행 (TIC-VLA 없음, Gemini 비전 + cmd_vel_mux)
+# ---------------------------------------------------------------------------
+SERBOT_REACT_DIRECT_CONFIG="$SERBOT_TICVLA_ROOT/config/react_direct.yaml"
+SERBOT_SCREENREC="$SERBOT_TICVLA_ROOT/scripts/screenrec.sh"
+
+function reactdrive() {
+    if [[ "$1" == "-h" || "$1" == "--help" || $# -lt 1 ]]; then
+        cat <<EOF
+사용법: reactdrive [--rec] "<목표 지시문>"
+  예: reactdrive "Find the red marker."
+      reactdrive --rec "Find the blue marker."   # 본체 모니터 화면도 녹화
+  TIC-VLA 없이 Gemini 가 카메라를 직접 보고 goto/rotate 를 골라 cmd_vel 로
+  실제 주행한다(agent/direct_drive_adapter.py, 설정 config/react_direct.yaml).
+  ★ 로봇이 움직인다. 다른 터미널에 'joystick' 을 먼저 띄워 둘 것 —
+    cmd_vel_mux/omni_drive_ctrl 이 같이 뜨고, 조이스틱을 건드리면 즉시 멈춘다.
+  사전 점검: GEMINI_API_KEY, odom 수신, camera_node, cmd_vel_mux.
+  로그: logs/react/react_<시각>.jsonl, 프레임: logs/react_direct/<시각>/
+  종료 코드: 0 found / 1 fail / 2 LLM 장애 / 3 운영자 개입·Ctrl+C
+EOF
+        return 0
+    fi
+
+    local rec=0
+    if [[ "$1" == "--rec" ]]; then
+        rec=1
+        shift
+    fi
+    local goal="$1"
+
+    if [[ -z "$GEMINI_API_KEY" ]]; then
+        echo "✗ GEMINI_API_KEY 가 없습니다 — export GEMINI_API_KEY=... 후 다시." >&2
+        return 1
+    fi
+    _serbot_source_ros || return 1
+    _serbot_ros_warmup
+
+    local odom_hz
+    if ! odom_hz=$(_serbot_get_hz "$SERBOT_ODOM_TOPIC" 6); then
+        echo "✗ $SERBOT_ODOM_TOPIC 수신이 안 됩니다 — 'bot' 으로 센서부터 띄우세요." >&2
+        return 1
+    fi
+    echo "✓ odom 수신 확인 (${odom_hz})"
+    if ! _serbot_running "$SERBOT_PAT_CAMERA"; then
+        echo "✗ camera_node 가 없습니다 — 'bot' 으로 띄우세요 ($SERBOT_CAMERA_TOPIC 구독)." >&2
+        return 1
+    fi
+    if ! _serbot_running "$SERBOT_PAT_MUX" || ! _serbot_running "$SERBOT_PAT_DRIVE"; then
+        echo "✗ cmd_vel_mux / omni_drive_ctrl 이 없습니다 — 다른 터미널에서 'joystick' 을 먼저 띄우세요." >&2
+        return 1
+    fi
+    if pgrep -f "$SERBOT_PAT_BRIDGE" >/dev/null 2>&1; then
+        echo "✗ ticvla_bridge.py 가 떠 있습니다 — 같은 /ticvla/cmd_vel 에 명령이 섞입니다. 먼저 내리세요." >&2
+        return 1
+    fi
+
+    echo ""
+    echo "목표: $goal"
+    echo "★ 로봇이 실제로 움직입니다. 주변을 비우고 조이스틱을 손에 드세요."
+    local ans
+    read "ans?계속할까요? [y/N] "
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "취소"; return 1; }
+
+    local -a cmd=("$SERBOT_TICVLA_ROOT/venvs/ticvla/bin/python3" -m agent.react_loop
+                  --direct --config "$SERBOT_REACT_DIRECT_CONFIG" --goal "$goal")
+    local rc
+    if (( rec )); then
+        local tag="react_$(echo "$goal" | tr -cs 'A-Za-z0-9' '_' | cut -c1-30)"
+        (cd "$SERBOT_TICVLA_ROOT" && "$SERBOT_SCREENREC" run "$tag" -- "${cmd[@]}")
+        rc=$?
+    else
+        (cd "$SERBOT_TICVLA_ROOT" && "${cmd[@]}")
+        rc=$?
+    fi
+    echo "종료 코드: $rc  (0 found / 1 fail / 2 LLM 장애 / 3 개입·중단)"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# screenrec — 본체 모니터 화면 녹화 (scripts/screenrec.sh 얇은 래퍼)
+# ---------------------------------------------------------------------------
+function screenrec() {
+    if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+        cat <<EOF
+사용법:
+  screenrec watch            # 수집 에피소드마다 자동 녹화 (colrec 과 다른 터미널에서)
+  screenrec start <이름>     # 수동 시작
+  screenrec stop             # 수동 종료
+  screenrec status
+  저장: $SERBOT_TICVLA_ROOT/logs/screenrec/
+EOF
+        return 0
+    fi
+    "$SERBOT_SCREENREC" "$@"
+}

@@ -1,0 +1,37 @@
+# ReAct 단독 실주행(--direct) 설정 — TIC-VLA 없이 Gemini 비전 + cmd_vel.
+# 필드 의미는 agent/config.py 의 DirectDriveConfig 를 볼 것.
+# 실행: reactdrive "Find the red marker."   (scripts/serbot_dev.zsh)
+
+gemini:
+  model: "gemini-3-flash-preview"
+  temperature: 0.2
+  max_output_tokens: 1024
+  request_timeout_sec: 30.0
+  retry:
+    initial_backoff_sec: 1.0
+    backoff_multiplier: 2.0
+    max_total_wait_sec: 60.0
+
+limits:
+  max_goto_calls: 6
+  max_total_steps: 20
+
+fewshot_path: "prompts/react_fewshot.txt"
+log_dir: "logs/react"
+
+direct:
+  camera_topic: "/camera/image_raw_fast"
+  odom_topic: "/wheel/odom"
+  cmd_vel_topic: "/ticvla/cmd_vel"   # cmd_vel_mux 입력 (mux 가 0.10m/s, 0.5rad/s 로 한 번 더 클램프)
+  sensor_stale_sec: 1.0
+  linear_speed: 0.08
+  angular_speed: 0.35
+  rotate_deg: 45.0
+  hfov_deg: 62.0                     # 카메라 수평 화각 — 회전이 계속 과/부족하면 이것부터 조정
+  max_servo_iters: 6
+  max_step_m: 0.6
+  stop_distance_m: 0.5
+  arrive_bbox_h: 0.45
+  heading_tolerance_deg: 6.0
+  motion_timeout_sec: 20.0
+  frame_save_dir: "logs/react_direct"

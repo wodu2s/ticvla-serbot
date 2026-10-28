@@ -60,12 +60,48 @@ class TicVlaConfig:
 
 
 @dataclass
+class DirectDriveConfig:
+    """--direct(ReAct 단독 주행, TIC-VLA 없음) 모드 설정.
+
+    Gemini 가 카메라 프레임을 직접 보고, goto/rotate 는 odom 폐루프 단순
+    cmd_vel 동작으로 실행한다. 속도는 cmd_vel_mux 가 한 번 더 클램프한다.
+    """
+
+    camera_topic: str = "/camera/image_raw_fast"
+    odom_topic: str = "/wheel/odom"
+    #: cmd_vel_mux 의 모델 입력 토픽. mux 가 0.5s 무수신이면 0 을 내보낸다.
+    cmd_vel_topic: str = "/ticvla/cmd_vel"
+    #: 이 시간(초) 동안 새 프레임/odom 이 없으면 동작을 중단한다.
+    sensor_stale_sec: float = 1.0
+    linear_speed: float = 0.08
+    angular_speed: float = 0.35
+    #: rotate[left|right] 한 번의 회전각(도).
+    rotate_deg: float = 45.0
+    #: 카메라 수평 화각(도). bbox 중심 → 방위각 환산에만 쓴다.
+    hfov_deg: float = 62.0
+    #: goto 한 번 안에서 (위치 추정 → 회전 → 전진) 반복 상한.
+    max_servo_iters: int = 6
+    #: 한 반복에서 전진하는 최대 거리(m).
+    max_step_m: float = 0.6
+    #: 추정 거리가 이 값 이하이거나 bbox 높이 비율이 arrive_bbox_h 이상이면 도착.
+    stop_distance_m: float = 0.5
+    arrive_bbox_h: float = 0.45
+    #: 방위각이 이 값(도) 이하면 회전 없이 바로 전진한다.
+    heading_tolerance_deg: float = 6.0
+    #: 동작 하나(회전/전진)의 시간 상한(초). 넘으면 정지하고 실패 처리.
+    motion_timeout_sec: float = 20.0
+    #: 스텝별 프레임 저장 디렉터리(상대경로면 저장소 루트 기준). 실행마다 하위 폴더 생성.
+    frame_save_dir: str = "logs/react_direct"
+
+
+@dataclass
 class ReactAgentConfig:
     """ReAct 루프 전체 설정."""
 
     gemini: GeminiConfig = field(default_factory=GeminiConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     ticvla: TicVlaConfig = field(default_factory=TicVlaConfig)
+    direct: DirectDriveConfig = field(default_factory=DirectDriveConfig)
     fewshot_path: str = "prompts/react_fewshot.txt"
     log_dir: str = "logs/react"
 
@@ -100,6 +136,8 @@ def load_config(config_path: str | Path) -> ReactAgentConfig:
         cfg.limits = LimitsConfig(**raw["limits"])
     if "ticvla" in raw:
         cfg.ticvla = TicVlaConfig(**raw["ticvla"])
+    if "direct" in raw:
+        cfg.direct = DirectDriveConfig(**raw["direct"])
     if "fewshot_path" in raw:
         cfg.fewshot_path = raw["fewshot_path"]
     if "log_dir" in raw:

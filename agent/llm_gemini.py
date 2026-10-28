@@ -86,7 +86,32 @@ class GeminiClient:
         """
         return elapsed_sec + next_backoff_sec <= retry_cfg.max_total_wait_sec
 
-    def generate(self, prompt: str) -> str:
+    def generate_with_image(self, prompt: str, jpeg_bytes: bytes) -> str:
+        """이미지 1장 + 텍스트 프롬프트를 보내고 생성된 텍스트를 받는다.
+
+        ReAct 단독 주행(agent/direct_drive_adapter.py)에서 TIC-VLA 대신 Gemini 가
+        장면 서술·목표 위치 추정을 직접 할 때 쓴다. 재시도/예외 정책은
+        ``generate()`` 와 같다.
+
+        Args:
+            prompt: 텍스트 프롬프트.
+            jpeg_bytes: JPEG 인코딩된 카메라 프레임.
+
+        Returns:
+            Gemini 가 생성한 원문 텍스트.
+
+        Raises:
+            LLMUnavailable: ``generate()`` 와 같은 조건.
+        """
+        from google.genai import types
+
+        contents = [
+            types.Part.from_bytes(data=jpeg_bytes, mime_type='image/jpeg'),
+            prompt,
+        ]
+        return self.generate(contents)
+
+    def generate(self, prompt) -> str:
         """프롬프트 전체를 보내고 생성된 텍스트를 받는다.
 
         매 호출마다 누적된 컨텍스트 전체(few-shot + 이력)를 ``prompt`` 하나로
@@ -105,6 +130,7 @@ class GeminiClient:
 
         Args:
             prompt: few-shot 예시 + 지금까지의 (행동, 관측) 이력을 담은 전체 텍스트.
+                ``generate_with_image()`` 에서는 [이미지 Part, 텍스트] 리스트.
 
         Returns:
             Gemini 가 생성한 원문 텍스트.
