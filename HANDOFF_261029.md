@@ -17,9 +17,12 @@ TIC-VLA 없이 **Gemini 가 카메라를 직접 보고 cmd_vel 로 주행하는 
 
 ### 1.1 Git
 
-- 브랜치: `morning-setup-261030` (main 에서 분기, push 안 함)
-- 마지막 커밋: `af0581c 아침 작업 세팅: ReAct 단독 주행, 수집 잔량, 분할/학습 래퍼, 화면 녹화`
-- **오늘 실차 테스트 중 고친 것 — 미커밋** (아래 파일만이 이번 작업분):
+- **브랜치 운영(10/30~)**: 로컬은 `main` 에서 작업한다. `git push` 는 항상 원격 `ticvla-serbot`(백업)으로 간다
+  (`branch.main.merge=refs/heads/ticvla-serbot`, `push.default=upstream`). 원격 `main` 은 **일주일 단위**로
+  `git weekly-main`(= `origin/ticvla-serbot` → `main` fast-forward) 으로만 올린다. GitHub 기본 브랜치는 `main`.
+  `morning-setup-261030` 은 합친 뒤 삭제했다.
+- 이번 작업 커밋: `8fb1c39 ReAct 단독 주행 실차 튜닝 + MCP 연결 옵션(stdio/HTTP)` — 원격 main·ticvla-serbot 에 반영됨.
+- **이번 작업분** (아래 파일, 모두 커밋됨):
 
 | 파일 | 변경 요지 |
 |---|---|
