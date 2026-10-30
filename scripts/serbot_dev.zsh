@@ -13,6 +13,9 @@ SERBOT_TICVLA_VENV_ACTIVATE="$SERBOT_TICVLA_ROOT/venvs/ticvla/bin/activate" # to
 
 SERBOT_BRIDGE_SCRIPT="$SERBOT_TICVLA_ROOT/scripts/ticvla_bridge.py"
 SERBOT_CMD_VEL_MUX="$SERBOT_TICVLA_ROOT/scripts/cmd_vel_mux.py"
+# mux 전진 속도 상한(m/s). omni_drive_ctrl 경로는 0.10 이 바퀴 명령 ±2 라 실속도 ~0.02 m/s
+# 였다(261029 ReAct 실주행) — 0.20 으로 올림. 조이스틱은 모터를 직접 돌려서 이 값과 무관.
+SERBOT_MUX_MAX_VX="0.20"
 SERBOT_COLLECT_DIR="$SERBOT_TICVLA_ROOT/collect"
 SERBOT_JOYSTICK_ERRAND="$SERBOT_COLLECT_DIR/joystick_errand.py"
 SERBOT_JOYSTICK_GOTOOBJECT="$SERBOT_COLLECT_DIR/joystick_gotoobject.py"
@@ -739,7 +742,7 @@ EOF
         echo "[2/2] cmd_vel_mux 이미 실행 중 — 건너뜀"
     else
         echo "[2/2] cmd_vel_mux 기동 중..."
-        nohup python3 "$SERBOT_CMD_VEL_MUX" \
+        nohup python3 "$SERBOT_CMD_VEL_MUX" --max-vx "$SERBOT_MUX_MAX_VX" \
             > "$SERBOT_LOG_DIR/cmd_vel_mux.log" 2>&1 &
         disown
         sleep 1
@@ -919,11 +922,14 @@ SERBOT_SCREENREC="$SERBOT_TICVLA_ROOT/scripts/screenrec.sh"
 function reactdrive() {
     if [[ "$1" == "-h" || "$1" == "--help" || $# -lt 1 ]]; then
         cat <<EOF
-사용법: reactdrive [--rec] "<목표 지시문>"
+사용법: reactdrive [--rec] [--mcp] "<목표 지시문>"
   예: reactdrive "Find the red marker."
       reactdrive --rec "Find the blue marker."   # 본체 모니터 화면도 녹화
   TIC-VLA 없이 Gemini 가 카메라를 직접 보고 goto/rotate 를 골라 cmd_vel 로
   실제 주행한다(agent/direct_drive_adapter.py, 설정 config/react_direct.yaml).
+  기본은 in-process(한 프로세스에서 어댑터 직접 호출, 261029 실차 12판과 같은 구조).
+  --mcp 면 주행 계층을 MCP 서버(agent/robot_mcp_server.py, 자식 프로세스)로 띄우고
+  ReAct 루프가 MCP 툴(observe/goto/rotate/stop)로 부른다 — 로그의 [mcp-server] 줄이 서버.
   ★ 로봇이 움직인다. 다른 터미널에 'joystick' 을 먼저 띄워 둘 것 —
     cmd_vel_mux/omni_drive_ctrl 이 같이 뜨고, 조이스틱을 건드리면 즉시 멈춘다.
   사전 점검: GEMINI_API_KEY, odom 수신, camera_node, cmd_vel_mux.
@@ -933,11 +939,15 @@ EOF
         return 0
     fi
 
-    local rec=0
-    if [[ "$1" == "--rec" ]]; then
-        rec=1
+    local rec=0 transport=
+    while [[ "$1" == --* ]]; do
+        case "$1" in
+            --rec) rec=1 ;;
+            --mcp) transport=--mcp ;;
+            *) echo "✗ 모르는 옵션: $1 (reactdrive -h)" >&2; return 1 ;;
+        esac
         shift
-    fi
+    done
     local goal="$1"
 
     if [[ -z "$GEMINI_API_KEY" ]]; then
@@ -965,16 +975,22 @@ EOF
         echo "✗ ticvla_bridge.py 가 떠 있습니다 — 같은 /ticvla/cmd_vel 에 명령이 섞입니다. 먼저 내리세요." >&2
         return 1
     fi
+    if ! pgrep -af "$SERBOT_PAT_MUX" | grep -q -- "--max-vx $SERBOT_MUX_MAX_VX"; then
+        echo "✗ 떠 있는 cmd_vel_mux 의 속도 상한이 $SERBOT_MUX_MAX_VX 가 아닙니다(옛 기본 0.10 이면 거의 못 감)." >&2
+        echo "   joystick 터미널 Ctrl+C → pkill -INT -f cmd_vel_mux.py → joystick 다시 실행." >&2
+        return 1
+    fi
 
     echo ""
     echo "목표: $goal"
+    if [[ -n "$transport" ]]; then echo "연결: MCP (agent.robot_mcp_server 자식 프로세스)"; else echo "연결: in-process"; fi
     echo "★ 로봇이 실제로 움직입니다. 주변을 비우고 조이스틱을 손에 드세요."
     local ans
     read "ans?계속할까요? [y/N] "
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "취소"; return 1; }
 
     local -a cmd=("$SERBOT_TICVLA_ROOT/venvs/ticvla/bin/python3" -m agent.react_loop
-                  --direct --config "$SERBOT_REACT_DIRECT_CONFIG" --goal "$goal")
+                  --direct $transport --config "$SERBOT_REACT_DIRECT_CONFIG" --goal "$goal")
     local rc
     if (( rec )); then
         local tag="react_$(echo "$goal" | tr -cs 'A-Za-z0-9' '_' | cut -c1-30)"

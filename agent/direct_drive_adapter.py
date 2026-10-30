@@ -39,10 +39,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: 제어 루프 주기(Hz). mux cmd_timeout(0.5s)보다 충분히 촘촘해야 한다.
 CONTROL_HZ = 20.0
-#: 회전 완료 허용 오차(도).
-YAW_TOL_DEG = 2.0
-#: 회전 끝무렵 최소 각속도(rad/s) — 너무 작으면 마찰로 멈춘다.
-MIN_WZ = 0.15
+#: 회전 완료 허용 오차(도). 바퀴 명령이 최저 단계(±1)라 2° 는 못 맞추고 맴돈다.
+YAW_TOL_DEG = 4.0
+#: 회전 끝무렵 최소 각속도(rad/s). omni_drive_ctrl 은 wz≈0.28 미만을 바퀴 명령 0 으로
+#: 반올림해 아예 안 돈다 — 261029 실주행에서 wz 0.23 으로 17초 서 있다가 회전 시간 초과.
+MIN_WZ = 0.35
 
 _DESCRIBE_PROMPT = """\
 You are the eyes of a small indoor mobile robot. Describe what the robot's \
@@ -135,9 +136,14 @@ class DirectDriveAdapter(TicVlaAdapter):
         self._odom_at = 0.0
         self._mux_reason: Optional[str] = None
         self._mux_at = 0.0
+        self._operator_abort: Optional[str] = None
 
         if not rclpy.ok():
-            rclpy.init()
+            # rclpy 기본 SIGINT 핸들러는 Ctrl+C 에 컨텍스트부터 내려서, 정지(0) 발행이
+            # 실패하고 spin 스레드가 ExternalShutdownException 을 뿜는다. Ctrl+C 는
+            # react_loop 의 KeyboardInterrupt 처리(정지 → close)에 맡긴다.
+            from rclpy.signals import SignalHandlerOptions
+            rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
         self._rclpy = rclpy
         self._node = rclpy.create_node('react_direct_drive')
         self._cmd_pub = self._node.create_publisher(Twist, cfg.cmd_vel_topic, 10)
@@ -181,6 +187,11 @@ class DirectDriveAdapter(TicVlaAdapter):
         with self._lock:
             self._mux_reason = msg.data
             self._mux_at = time.monotonic()
+            # 래치: mux 의 'joystick' 은 스틱을 놓고 joy_hold(1초) 뒤 'ok' 로 돌아간다.
+            # 로봇이 서서 Gemini 를 기다리는 동안(최대 십수 초) 건드리면 다음 동작
+            # 전에 이미 풀려서 개입을 놓치고 다시 달린다 — 한 번이라도 보이면 기억한다.
+            if msg.data in ('joystick', 'estop') and self._operator_abort is None:
+                self._operator_abort = msg.data
 
     # ── 상태 확인 ─────────────────────────────────────────────────────
 
@@ -221,10 +232,10 @@ class DirectDriveAdapter(TicVlaAdapter):
         """운영자 개입/센서 끊김을 확인한다. 문제가 있으면 예외."""
         now = time.monotonic()
         with self._lock:
-            reason = self._mux_reason
+            reason = self._operator_abort
             odom_age = now - self._odom_at
             frame_age = now - self._frame_at
-        if reason in ('joystick', 'estop'):
+        if reason is not None:
             raise OperatorAbort(f'cmd_vel_mux 상태={reason} — 운영자 개입')
         if odom_age > self._cfg.sensor_stale_sec:
             raise MotionError(f'odom {odom_age:.1f}s 끊김')
@@ -279,8 +290,11 @@ class DirectDriveAdapter(TicVlaAdapter):
         try:
             while moved < dist_m:
                 self._check_safety()
-                if time.monotonic() - started > self._cfg.motion_timeout_sec:
-                    raise MotionError('전진 시간 초과')
+                elapsed = time.monotonic() - started
+                if elapsed > self._cfg.motion_timeout_sec:
+                    raise MotionError(
+                        f'전진 시간 초과 — {elapsed:.0f}초 동안 odom {moved:.2f}/{dist_m:.2f} m '
+                        f'(실속도 {moved / elapsed:.3f} m/s, 명령 {self._cfg.linear_speed} m/s)')
                 self._publish(self._cfg.linear_speed, 0.0)
                 time.sleep(1.0 / CONTROL_HZ)
                 with self._lock:
@@ -311,6 +325,20 @@ class DirectDriveAdapter(TicVlaAdapter):
         jpeg = self._grab_jpeg(tag)
         return self._llm.generate_with_image(_DESCRIBE_PROMPT, jpeg).strip()
 
+    def _describe_soft(self, tag: str, fallback: str) -> str:
+        """동작 결과는 이미 정해졌고 장면 서술만 덧붙이는 자리에서 쓴다.
+
+        서술 호출이 실패(응답 지연·타임아웃)해도 그 동작의 결과(도착 등)까지
+        "[ERROR] vision call failed" 로 덮으면 안 된다 — 261029 12:43 실주행에서
+        도착(box_h 0.56) 직후 서술이 30초×2 타임아웃 나서 결과가 에러로 바뀌었고,
+        장면 정보가 없어진 LLM 이 엉뚱한 방향으로 rotate 했다.
+        """
+        try:
+            return self._describe(tag)
+        except LLMUnavailable as exc:
+            self._log.warning(f'장면 서술 실패({exc.reason}) — 동작 결과는 유지한다')
+            return fallback
+
     def _locate(self, target: str, tag: str) -> Optional[dict]:
         """타깃 bbox/거리를 묻는다. 안 보이거나 파싱 실패면 None."""
         jpeg = self._grab_jpeg(tag)
@@ -340,7 +368,13 @@ class DirectDriveAdapter(TicVlaAdapter):
         except MotionError as exc:
             self._halt()
             self._log.error(f'동작 실패: {exc}')
-            return f'[ERROR] motion aborted ({exc}). The robot stopped.'
+            # 장면 서술을 붙여야 LLM 이 다음 goto 대상을 고를 수 있다 — 없으면
+            # 직전 관측에 랜드마크 이름이 없어 goto 가 전부 무효가 된다(261029).
+            try:
+                scene = ' ' + self._describe('after-motion-error')
+            except (MotionError, LLMUnavailable):
+                scene = ''
+            return f'[ERROR] motion aborted ({exc}). The robot stopped.{scene}'
 
     def initial_observation(self) -> str:
         return self._safe(self._describe, 'init')
@@ -351,35 +385,57 @@ class DirectDriveAdapter(TicVlaAdapter):
     def _goto(self, target: str) -> str:
         cfg = self._cfg
         total_moved = 0.0
+        last_box_h = 0.0
         for it in range(1, cfg.max_servo_iters + 1):
             loc = self._locate(target, f'goto-{target}-{it}')
             if loc is None:
-                scene = self._describe(f'goto-{target}-lost')
-                prefix = ('The target is not visible from here.' if it == 1 else
-                          f'Moved {total_moved:.1f} m toward the {target}, then lost sight of it.')
+                scene = self._describe_soft(
+                    f'goto-{target}-lost', '(Scene description unavailable right now.)')
+                if it == 1:
+                    prefix = 'The target is not visible from here.'
+                elif last_box_h >= 0.25:
+                    # 크게 보이다가 사라지면 화면 밖으로 잘릴 만큼 가까워진 것이다.
+                    prefix = (f'Moved {total_moved:.1f} m toward the {target}; it is now so '
+                              'close that it no longer fits in the camera view. Do not go '
+                              'further forward.')
+                else:
+                    prefix = f'Moved {total_moved:.1f} m toward the {target}, then lost sight of it.'
                 return f'{prefix} {scene}'
             ymin, xmin, ymax, xmax = (float(v) / 1000.0 for v in loc['box_2d'])
             cx = (xmin + xmax) / 2.0
             box_h = max(0.0, ymax - ymin)
-            dist = float(loc.get('distance_m') or 0.0)
+            last_box_h = box_h
+            llm_dist = float(loc.get('distance_m') or 0.0)
+            bbox_dist = cfg.bbox_dist_k / box_h if box_h > 0.0 else 0.0
+            # 둘 중 가까운 쪽(0 은 "모름")
+            dist = min((d for d in (llm_dist, bbox_dist) if d > 0.0), default=0.0)
             bearing_deg = (0.5 - cx) * cfg.hfov_deg  # + = 왼쪽(반시계)
             self._log.info(
                 f'[goto {target} #{it}] cx={cx:.2f} box_h={box_h:.2f} '
-                f'dist≈{dist:.2f}m bearing={bearing_deg:+.1f}°')
+                f'dist≈{dist:.2f}m (gemini {llm_dist:.2f}, bbox {bbox_dist:.2f}) '
+                f'bearing={bearing_deg:+.1f}°')
 
-            if box_h >= cfg.arrive_bbox_h or (0.0 < dist <= cfg.stop_distance_m):
+            # 박스 아래쪽이 화면 끝에 닿으면 이미 코앞이다 — 더 가면 부딪힌다.
+            touching_bottom = ymax >= 0.97
+            if (box_h >= cfg.arrive_bbox_h or touching_bottom
+                    or (0.0 < dist <= cfg.stop_distance_m)):
                 if abs(bearing_deg) > cfg.heading_tolerance_deg:
                     self._rotate_by(math.radians(bearing_deg))
-                scene = self._describe(f'goto-{target}-arrived')
+                scene = self._describe_soft(
+                    f'goto-{target}-arrived',
+                    f'(Scene description unavailable; the {target} is right in front of the robot.)')
                 return f'The robot is now directly in front of the {target}. {scene}'
 
             if abs(bearing_deg) > cfg.heading_tolerance_deg:
                 self._rotate_by(math.radians(bearing_deg))
             step = cfg.max_step_m if dist <= 0.0 else min(
-                cfg.max_step_m, max(0.1, dist - cfg.stop_distance_m))
+                cfg.max_step_m,
+                max(0.1, cfg.step_fraction * (dist - cfg.stop_distance_m)))
+            self._log.info(f'[goto {target} #{it}] 전진 {step:.2f} m')
             total_moved += self._forward_by(step)
 
-        scene = self._describe(f'goto-{target}-limit')
+        scene = self._describe_soft(
+            f'goto-{target}-limit', f'(Scene description unavailable; the {target} is still ahead.)')
         return (f'Moved {total_moved:.1f} m toward the {target} but did not reach '
                 f'it within {cfg.max_servo_iters} attempts. {scene}')
 
@@ -389,7 +445,8 @@ class DirectDriveAdapter(TicVlaAdapter):
     def _rotate_obs(self, direction: str) -> str:
         sign = 1.0 if direction == 'left' else -1.0
         turned = self._rotate_by(sign * math.radians(self._cfg.rotate_deg))
-        scene = self._describe(f'rotate-{direction}')
+        scene = self._describe_soft(
+            f'rotate-{direction}', '(Scene description unavailable right now.)')
         return f'Turned {direction} {abs(math.degrees(turned)):.0f} degrees. {scene}'
 
     def stop(self) -> None:
@@ -398,11 +455,44 @@ class DirectDriveAdapter(TicVlaAdapter):
         except Exception:  # noqa: BLE001 — stop() 은 예외를 던지면 안 된다
             pass
 
+    def start_episode(self, run_label: str) -> None:
+        """새 에피소드를 시작한다(MCP HTTP 모드에서 서버가 여러 에피소드를 이어 받을 때).
+
+        프레임 저장 폴더를 바꾸고 지난 에피소드의 중단 래치를 푼다. 지금도
+        조이스틱/E-Stop 이 잡혀 있으면 풀지 않고 거부한다.
+
+        Raises:
+            RuntimeError: mux 상태가 아직 joystick/estop/disabled 인 경우.
+        """
+        with self._lock:
+            reason = self._mux_reason
+            if reason in ('joystick', 'estop', 'disabled'):
+                raise RuntimeError(f'cmd_vel_mux 상태={reason} — 해제 후 다시 시작할 것')
+            self._operator_abort = None
+        self._frame_dir = self._frame_dir.parent / run_label
+        self._frame_dir.mkdir(parents=True, exist_ok=True)
+        self._frame_seq = 0
+        self._log.info(f'새 에피소드 {run_label} — 프레임: {self._frame_dir}')
+
+    def request_abort(self, reason: str) -> None:
+        """다른 스레드에서 진행 중인 goto/rotate 를 끊는다(MCP stop 툴).
+
+        조이스틱 개입과 같은 래치를 쓴다 — 동작 루프가 다음 제어 주기의
+        ``_check_safety`` 에서 OperatorAbort 를 내고, 이후 동작도 전부 거부한다.
+        """
+        with self._lock:
+            if self._operator_abort is None:
+                self._operator_abort = reason
+        self.stop()
+
     def close(self) -> None:
         """정지 후 ROS 노드를 내린다. 여러 번 불려도 안전하다."""
         self.stop()
         try:
             self._executor.shutdown()
+            # spin 스레드가 끝나기 전에 rclpy 를 내리면 C++ 쪽에서 abort 가 난다
+            # ("terminate called without an active exception", 종료 코드 134).
+            self._spin_thread.join(timeout=2.0)
             self._node.destroy_node()
             if self._rclpy.ok():
                 self._rclpy.shutdown()

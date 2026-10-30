@@ -11,14 +11,19 @@ Gemini 호출이 재시도 상한 안에서도 실패하면 ``LLMUnavailable`` �
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
+import tempfile
 import time
 from typing import Optional
 
 from agent.config import GeminiConfig, RetryConfig
 
 logger = logging.getLogger('llm_gemini')
+
+#: 프로세스 간 공유하는 마지막 호출 시각(_throttle 참고).
+_THROTTLE_PATH = os.path.join(tempfile.gettempdir(), f'serbot_gemini_throttle_{os.getuid()}')
 
 
 class LLMUnavailable(RuntimeError):
@@ -67,9 +72,12 @@ class GeminiClient:
         http_options = types.HttpOptions(
             timeout=int(cfg.request_timeout_sec * 1000))
         self._client = genai.Client(api_key=api_key, http_options=http_options)
+        thinking = (types.ThinkingConfig(thinking_level=cfg.thinking_level)
+                    if cfg.thinking_level else None)
         self._generation_config = types.GenerateContentConfig(
             temperature=cfg.temperature,
             max_output_tokens=cfg.max_output_tokens,
+            thinking_config=thinking,
         )
 
     def _should_retry(self, elapsed_sec: float, next_backoff_sec: float,
@@ -149,6 +157,7 @@ class GeminiClient:
 
         while True:
             attempt += 1
+            self._throttle()
             try:
                 response = self._client.models.generate_content(
                     model=self._cfg.model,
@@ -190,4 +199,36 @@ class GeminiClient:
             text = response.text
             if not text:
                 raise LLMUnavailable(None, f'Gemini 응답이 비어 있다: {response!r}')
+            finish = getattr((response.candidates or [None])[0], 'finish_reason', None)
+            if finish is not None and 'MAX_TOKENS' in str(finish):
+                logger.warning(
+                    f'Gemini 응답이 max_output_tokens({self._cfg.max_output_tokens})에서 '
+                    '잘렸다 — thinking_level 을 낮추거나 max_output_tokens 를 올릴 것.')
             return text
+
+    def _throttle(self) -> None:
+        """직전 호출과 ``min_call_interval_sec`` 이상 벌어지도록 기다린다.
+
+        쿼터는 API 키 단위라 프로세스가 갈라져도 같이 세야 한다 — MCP 모드에서는
+        ReAct 루프(클라이언트)와 로봇 서버(direct 비전 호출)가 각자 Gemini 를
+        부른다. 그래서 마지막 호출 시각을 잠금 파일 하나로 공유한다.
+        """
+        gap = self._cfg.min_call_interval_sec
+        if gap <= 0:
+            return
+        with open(_THROTTLE_PATH, 'a+', encoding='utf-8') as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            try:
+                last = float(fh.read().strip() or 0.0)
+            except ValueError:
+                last = 0.0
+            wait = last + gap - time.time()
+            if wait > gap + 1.0:  # 시계가 뒤로 갔거나 파일이 깨졌다
+                wait = 0.0
+            if wait > 0:
+                logger.info(f'Gemini 호출 간격 유지 — {wait:.1f}초 대기 (분당 한도)')
+                time.sleep(wait)
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f'{time.time():.6f}')

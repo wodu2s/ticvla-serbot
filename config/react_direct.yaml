@@ -3,9 +3,11 @@
 # 실행: reactdrive "Find the red marker."   (scripts/serbot_dev.zsh)
 
 gemini:
-  model: "gemini-3-flash-preview"
+  model: "gemini-3.5-flash-lite"    # 3-flash-preview 는 무료 등급 하루 20회 — 261029 소진. lite 는 쿼터 별도
   temperature: 0.2
   max_output_tokens: 1024
+  thinking_level: "low"            # 사고 토큰이 출력 한도를 먹어 답이 잘리던 문제(261029)
+  min_call_interval_sec: 12.5      # 무료 등급 분당 5회 — 유료 키면 0 으로
   request_timeout_sec: 30.0
   retry:
     initial_backoff_sec: 1.0
@@ -22,16 +24,18 @@ log_dir: "logs/react"
 direct:
   camera_topic: "/camera/image_raw_fast"
   odom_topic: "/wheel/odom"
-  cmd_vel_topic: "/ticvla/cmd_vel"   # cmd_vel_mux 입력 (mux 가 0.10m/s, 0.5rad/s 로 한 번 더 클램프)
+  cmd_vel_topic: "/ticvla/cmd_vel"   # cmd_vel_mux 입력 (mux 가 --max-vx(0.20)·0.5rad/s 로 한 번 더 클램프)
   sensor_stale_sec: 1.0
-  linear_speed: 0.08
-  angular_speed: 0.35
+  linear_speed: 0.20                 # 0.10 은 omni_drive 바퀴 명령 ±2 → 실속도 ~0.02 m/s(261029). mux --max-vx 0.20 필요(joystick 이 띄움)
+  angular_speed: 0.50                # mux 상한. 그래도 바퀴 명령 ±1 이라 회전이 약하면 omni_drive 매핑 문제
   rotate_deg: 45.0
   hfov_deg: 62.0                     # 카메라 수평 화각 — 회전이 계속 과/부족하면 이것부터 조정
   max_servo_iters: 6
-  max_step_m: 0.6
+  max_step_m: 1.0                    # 한 번에 더 멀리 — 판단(LLM) 사이 정지 횟수를 줄인다
   stop_distance_m: 0.5
   arrive_bbox_h: 0.45
+  bbox_dist_k: 0.40                  # bbox 거리 ≈ k / box_h — Gemini 거리와 비교해 가까운 쪽 사용(261029 마커 충돌 직전)
+  step_fraction: 0.6                 # 남은 거리의 60% 씩만 전진
   heading_tolerance_deg: 6.0
   motion_timeout_sec: 20.0
   frame_save_dir: "logs/react_direct"

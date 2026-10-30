@@ -146,12 +146,21 @@ class CmdVelMux(Node):
     def _on_joy(self, msg: Twist) -> None:
         """조이스틱 명령을 저장한다. 발행은 타이머가 한다.
 
+        joystick_gotoobject.py 는 스틱을 놓아도 0 을 30Hz 로 계속 보낸다. 그래서
+        우선권 시각(_joy_at)은 0 이 아닌 명령에서만 갱신한다 — 안 그러면 조이스틱
+        프로세스가 떠 있는 것만으로 모델 명령이 영원히 막힌다. 스틱을 놓은 뒤
+        joy_hold 동안은 마지막 메시지(0)를 내보내 정지시키고 그다음 모델에 넘긴다.
+
         Args:
             msg: /joystick_cmd_vel Twist.
         """
+        active = any(abs(v) > 1e-6 for v in (
+            msg.linear.x, msg.linear.y, msg.linear.z,
+            msg.angular.x, msg.angular.y, msg.angular.z))
         with self._lock:
             self._joy = _copy_twist(msg)
-            self._joy_at = time.monotonic()
+            if active:
+                self._joy_at = time.monotonic()
 
     def _on_estop(self, msg: Bool) -> None:
         """비상정지를 래치한다.

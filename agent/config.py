@@ -34,6 +34,13 @@ class GeminiConfig:
     #: 없으면 연결이 느려지거나 멈췄을 때 예외 자체가 안 나서 retry 로직이
     #: 발동하지 못하고 generate() 가 무한정 블로킹된다.
     request_timeout_sec: float = 30.0
+    #: Gemini 3 사고(thinking) 수준("minimal"/"low"/"medium"/"high"). None 이면
+    #: 모델 기본값. 사고 토큰도 max_output_tokens 를 먹어서, 기본값이면 답이
+    #: 중간에 잘리는 일이 생긴다(261029 실주행: think[...] 가 닫히지 않음).
+    thinking_level: Optional[str] = None
+    #: 호출 사이 최소 간격(초). 무료 등급은 분당 5회(gemini-3-flash)라
+    #: 12.5 정도로 두면 429 를 피한다. 0 이면 제한 없음.
+    min_call_interval_sec: float = 0.0
     retry: RetryConfig = field(default_factory=RetryConfig)
 
 
@@ -86,6 +93,13 @@ class DirectDriveConfig:
     #: 추정 거리가 이 값 이하이거나 bbox 높이 비율이 arrive_bbox_h 이상이면 도착.
     stop_distance_m: float = 0.5
     arrive_bbox_h: float = 0.45
+    #: bbox 높이로 본 거리 ≈ bbox_dist_k / box_h. Gemini 의 distance_m 은 가까워져도
+    #: 1.5→1.73 m 로 커지는 등 믿을 수 없어서(261029, 마커에 부딪힐 뻔함) 둘 중 가까운
+    #: 쪽을 쓴다. 261029 프레임(box_h 0.19→0.31, odom 1.0 m)에서 ≈0.49 — 보수적으로 0.40.
+    bbox_dist_k: float = 0.40
+    #: 남은 거리(추정 − stop_distance_m) 중 한 번에 가는 비율. 추정 오차를 다음
+    #: 관측에서 다시 보정할 여지를 남긴다.
+    step_fraction: float = 0.6
     #: 방위각이 이 값(도) 이하면 회전 없이 바로 전진한다.
     heading_tolerance_deg: float = 6.0
     #: 동작 하나(회전/전진)의 시간 상한(초). 넘으면 정지하고 실패 처리.

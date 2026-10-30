@@ -48,3 +48,6 @@ logs/
 *.tar.gz
 *.ckpt
 *.pt
+
+# 개인 키/환경 파일 (GEMINI_API_KEY 등) — 절대 커밋 금지
+.env

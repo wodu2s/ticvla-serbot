@@ -21,6 +21,11 @@ TIC-VLA 는 "보이는 목표로 이동"만 할 수 있다. 이 루프는 그 �
     # agent/direct_drive_adapter.py 참고. ROS 를 source 한 셸에서.)
     GEMINI_API_KEY=... venvs/ticvla/bin/python3 -m agent.react_loop \\
         --direct --config config/react_direct.yaml --goal "Find the red marker."
+
+    # 위 두 모드를 MCP 로 분리: 로봇 행동 계층(agent/robot_mcp_server.py)을 MCP
+    # 서버(stdio 자식 프로세스)로 띄우고, 이 루프는 MCP 클라이언트로 툴을 부른다.
+    GEMINI_API_KEY=... venvs/ticvla/bin/python3 -m agent.react_loop \\
+        --direct --mcp --config config/react_direct.yaml --goal "Find the red marker."
 """
 from __future__ import annotations
 
@@ -323,6 +328,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument('--direct', action='store_true',
                         help='ReAct 단독 실주행: TIC-VLA 없이 Gemini 가 카메라를 직접 보고 '
                              'cmd_vel 로 로봇을 움직인다(config 의 direct 섹션).')
+    parser.add_argument('--mcp', action='store_true',
+                        help='로봇 행동 계층(TIC-VLA 또는 --direct 주행)을 MCP 서버로 띄워 '
+                             '툴 호출로 연결한다(agent/robot_mcp_server.py, stdio 자식 프로세스).')
+    parser.add_argument('--mcp-url', default=None,
+                        help='이미 떠 있는 MCP HTTP 서버에 붙는다(예: http://127.0.0.1:8765/mcp). '
+                             '--mcp 를 포함한다. 서버 모드/설정은 서버를 띄울 때 정한다.')
     return parser.parse_args(argv)
 
 
@@ -354,8 +365,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error('--dry-run 과 --direct 는 같이 쓸 수 없다.')
         return 1
 
+    if args.mcp_url:
+        args.mcp = True
+    if args.dry_run and args.mcp:
+        logger.error('--dry-run 은 표준입력으로 관측을 받으므로 --mcp 와 같이 쓸 수 없다.')
+        return 1
+
     adapter: TicVlaAdapter
-    if args.dry_run:
+    if args.mcp:
+        from agent.mcp_robot_adapter import McpRobotAdapter
+        try:
+            adapter = McpRobotAdapter('direct' if args.direct else 'ticvla',
+                                      args.config, run_label, logger, url=args.mcp_url)
+        except RuntimeError as exc:
+            logger.error(str(exc))
+            return 1
+    elif args.dry_run:
         adapter = DryRunAdapter()
     elif args.direct:
         from agent.direct_drive_adapter import DirectDriveAdapter
