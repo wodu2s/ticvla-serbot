@@ -26,12 +26,18 @@ TIC-VLA 는 "보이는 목표로 이동"만 할 수 있다. 이 루프는 그 �
     # 서버(stdio 자식 프로세스)로 띄우고, 이 루프는 MCP 클라이언트로 툴을 부른다.
     GEMINI_API_KEY=... venvs/ticvla/bin/python3 -m agent.react_loop \\
         --direct --mcp --config config/react_direct.yaml --goal "Find the red marker."
+
+    # 로봇 밖 MCP 구조(261104): 노트북에서 mcp_server.server 를 띄워 두고(로봇은
+    # robot_api.server) 이 루프를 노트북에서 MCP 클라이언트로 돌린다.
+    python -m agent.react_loop --adapter mcp --config config/react_direct.yaml \\
+        --goal "Find the book."
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -334,7 +340,28 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument('--mcp-url', default=None,
                         help='이미 떠 있는 MCP HTTP 서버에 붙는다(예: http://127.0.0.1:8765/mcp). '
                              '--mcp 를 포함한다. 서버 모드/설정은 서버를 띄울 때 정한다.')
+    parser.add_argument('--adapter', choices=('mcp',), default=None,
+                        help='mcp: 노트북 MCP 서버(mcp_server, serbot-tools)에 붙는다 — 로봇 밖 '
+                             '구조(261104). --mcp-url 이 없으면 ' + DEFAULT_MCP_URL + '. '
+                             'GEMINI_API_KEY 가 없으면 저장소 루트 .env 에서 읽는다.')
     return parser.parse_args(argv)
+
+
+#: --adapter mcp 기본 주소(mcp_server.server 기본 바인딩).
+DEFAULT_MCP_URL = 'http://127.0.0.1:8765/mcp'
+
+
+def _load_dotenv(path: Path) -> None:
+    """KEY=VALUE(.env, export 접두어 허용)에서 비어 있는 환경변수만 채운다."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip().removeprefix('export ').strip()
+        os.environ.setdefault(key, value.strip().strip('"\''))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -343,6 +370,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                         format='%(asctime)s [%(levelname)s] %(message)s',
                         datefmt='%H:%M:%S')
     args = _parse_args(argv)
+    if args.adapter == 'mcp':
+        if args.direct or args.dry_run:
+            logger.error('--adapter mcp 는 --direct/--dry-run 과 같이 쓸 수 없다(주행은 로봇 API 가 한다).')
+            return 1
+        args.mcp_url = args.mcp_url or DEFAULT_MCP_URL
+        _load_dotenv(PROJECT_ROOT / '.env')
 
     try:
         cfg = load_config(args.config)

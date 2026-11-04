@@ -11,19 +11,51 @@ Gemini 호출이 재시도 상한 안에서도 실패하면 ``LLMUnavailable`` �
 """
 from __future__ import annotations
 
-import fcntl
+import getpass
 import logging
 import os
 import tempfile
 import time
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
+
+try:  # Linux(로봇)
+    import fcntl
+except ImportError:  # Windows(노트북 에이전트, MCP 구조 C단계)
+    fcntl = None
+    import msvcrt
 
 from agent.config import GeminiConfig, RetryConfig
 
 logger = logging.getLogger('llm_gemini')
 
-#: 프로세스 간 공유하는 마지막 호출 시각(_throttle 참고).
-_THROTTLE_PATH = os.path.join(tempfile.gettempdir(), f'serbot_gemini_throttle_{os.getuid()}')
+#: 프로세스 간 공유하는 마지막 호출 시각(_throttle 참고). os.getuid 는 Windows 에 없다.
+_USER_TAG = os.getuid() if hasattr(os, 'getuid') else getpass.getuser()
+_THROTTLE_PATH = os.path.join(tempfile.gettempdir(), f'serbot_gemini_throttle_{_USER_TAG}')
+
+
+@contextmanager
+def _exclusive_lock(fh) -> Iterator[None]:
+    """열린 파일에 프로세스 간 배타 잠금을 건다(Linux flock / Windows msvcrt)."""
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        return
+    fh.seek(0)
+    while True:  # LK_LOCK 은 10초 뒤 실패하므로 논블로킹으로 직접 재시도
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            break
+        except OSError:
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class LLMUnavailable(RuntimeError):
@@ -216,8 +248,7 @@ class GeminiClient:
         gap = self._cfg.min_call_interval_sec
         if gap <= 0:
             return
-        with open(_THROTTLE_PATH, 'a+', encoding='utf-8') as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
+        with open(_THROTTLE_PATH, 'a+', encoding='utf-8') as fh, _exclusive_lock(fh):
             fh.seek(0)
             try:
                 last = float(fh.read().strip() or 0.0)

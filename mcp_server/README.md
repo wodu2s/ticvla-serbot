@@ -35,6 +35,18 @@ $env:ROBOT_API_TOKEN="mock-token-not-secret-0123456789"; .\.venv-mcp\Scripts\pyt
 
 자동 테스트(서브프로세스로 둘 다 띄움): `.\.venv-mcp\Scripts\python -m pytest mcp_server\tests -q`
 
+## 에이전트 (MCP 클라이언트)
+
+저장소 루트 `.env` 에 `GEMINI_API_KEY=...` (없으면 환경변수). MCP 서버를 띄운 상태에서:
+
+```powershell
+.\.venv-mcp\Scripts\python -m agent.react_loop --adapter mcp --config config/react_direct.yaml --goal "Find the book."
+```
+
+로그 `logs/react/react_<시각>.jsonl` 은 기존 reactdrive 로그와 같은 형식.
+주의: Gemini 호출 간격 제한은 기계별이라, 노트북(에이전트)·로봇(locate/서술)이 같은 키를
+쓰면 합쳐서 분당 한도를 넘을 수 있다.
+
 ## 2) 실제 로봇
 
 로봇(Jetson, ROS source 한 셸):
