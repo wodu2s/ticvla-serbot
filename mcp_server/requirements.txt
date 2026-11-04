@@ -1,0 +1,11 @@
+# 노트북(Windows)용 — Python 3.10+
+# python -m pip install -r mcp_server/requirements.txt
+# 로봇(venvs/ticvla)에서 검증한 버전으로 고정
+mcp==2.3.0
+httpx==0.28.1
+httpcore>=1.0.9
+uvicorn==0.38.0
+anyio
+# 아래는 mock 로봇(robot_api.mock)을 노트북에서 띄울 때만
+fastapi==0.124.0
+pyyaml

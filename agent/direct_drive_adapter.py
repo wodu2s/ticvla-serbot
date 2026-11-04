@@ -485,6 +485,22 @@ class DirectDriveAdapter(TicVlaAdapter):
                 self._operator_abort = reason
         self.stop()
 
+    def health(self) -> dict:
+        """센서/mux 수신 상태와 중단 래치를 읽기 전용으로 돌려준다(robot_api /status 용).
+
+        나이(age)는 마지막 수신 후 지난 초. 한 번도 안 들어왔으면 None.
+        """
+        now = time.monotonic()
+        with self._lock:
+            return {
+                'mux_reason': self._mux_reason,
+                'mux_age_sec': (now - self._mux_at) if self._mux_reason is not None else None,
+                'odom_age_sec': (now - self._odom_at) if self._odom is not None else None,
+                'frame_age_sec': (now - self._frame_at) if self._frame is not None else None,
+                'abort_latch': self._operator_abort,
+                'cmd_vel_topic': self._cfg.cmd_vel_topic,
+            }
+
     def close(self) -> None:
         """정지 후 ROS 노드를 내린다. 여러 번 불려도 안전하다."""
         self.stop()

@@ -1,0 +1,21 @@
+# 로봇 스킬 HTTP API(robot_api/server.py) 설정 — 로봇(Jetson)에서 실행.
+# 제어 파라미터(속도·회전각·도착 판정)는 여기 없다. adapter_config 의 direct: 절을
+# 그대로 쓴다(S4: 속도 상한은 로봇 쪽 설정만 따르고 요청으로 바꿀 수 없다).
+
+adapter_config: "config/react_direct.yaml"
+
+# Tailscale 주소에만 bind 한다. 0.0.0.0 / :: 는 서버가 거부한다.
+host: "100.122.61.97"
+port: 8100
+
+# S2: 진행 중인 스킬이 있을 때 이 시간 동안 POST /lease 가 없으면 중단 + 정지.
+lease_timeout_sec: 3.0
+
+# S3: 스킬 전체 시간 상한(초). 개별 동작 상한은 direct.motion_timeout_sec(20초).
+# goto 는 최대 max_servo_iters(6)회 × (locate Gemini 호출 + 전진) + 마지막 서술이라
+# Gemini 호출 간격(12.5초)까지 감안해 넉넉히 잡는다.
+goto_timeout_sec: 180.0
+rotate_timeout_sec: 60.0
+
+# 토큰 파일(ROBOT_API_TOKEN=..., 선택적으로 GEMINI_API_KEY=...). 권한 600 이 아니면 거부.
+env_file: "robot_api/.env"
