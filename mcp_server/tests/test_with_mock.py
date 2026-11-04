@@ -61,7 +61,10 @@ def stack(tmp_path_factory):
                'log_dir': log_dir, 'env': env}
     finally:
         for p in procs:
-            p.send_signal(signal.SIGINT)
+            if sys.platform == 'win32':
+                p.terminate()          # Windows 는 SIGINT 를 못 보낸다(ValueError → 프로세스가 남음)
+            else:
+                p.send_signal(signal.SIGINT)
         for p in procs:
             try:
                 p.wait(5)
