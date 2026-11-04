@@ -40,14 +40,9 @@ third_party/TIC-VLA/**/.collect.mapping.json
 # Hugging Face 캐시
 **/.hf_cache/
 **/.cache/
-data/
-third_party/
-checkpoints/
-models/
-logs/
+
+# 아카이브
 *.tar.gz
-*.ckpt
-*.pt
 
 # 개인 키/환경 파일 (GEMINI_API_KEY 등) — 절대 커밋 금지
 .env
