@@ -13,7 +13,7 @@
 
 ```powershell
 git clone <repo> TIC-VLA; cd TIC-VLA
-py -3.10 -m venv .venv-mcp
+py -3.10 -m venv .venv-mcp   # 3.10 이상 (3.13 에서 확인)
 .\.venv-mcp\Scripts\python -m pip install -r mcp_server\requirements.txt
 ```
 
@@ -33,7 +33,12 @@ $env:ROBOT_API_TOKEN="mock-token-not-secret-0123456789"; .\.venv-mcp\Scripts\pyt
 $env:ROBOT_API_TOKEN="mock-token-not-secret-0123456789"; .\.venv-mcp\Scripts\python -m mcp_server.server --robot-url http://127.0.0.1:8100
 ```
 
-자동 테스트(서브프로세스로 둘 다 띄움): `.\.venv-mcp\Scripts\python -m pytest mcp_server\tests -q`
+자동 테스트(서브프로세스로 둘 다 띄움, pytest 는 requirements 에 없어 따로 설치):
+
+```powershell
+.\.venv-mcp\Scripts\python -m pip install pytest
+.\.venv-mcp\Scripts\python -m pytest mcp_server\tests -q
+```
 
 ## 에이전트 (MCP 클라이언트)
 

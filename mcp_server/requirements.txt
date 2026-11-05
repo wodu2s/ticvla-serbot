@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# ↑ pip 가 한국어 주석을 cp949(Windows 한국어 로캘)로 읽어 실패하는 것을 막는다 — 첫 두 줄 안에 있어야 함
 # 노트북(Windows)용 — Python 3.10+
 # python -m pip install -r mcp_server/requirements.txt
 # 로봇(venvs/ticvla)에서 검증한 버전으로 고정
