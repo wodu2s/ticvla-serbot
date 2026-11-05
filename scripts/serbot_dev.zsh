@@ -14,8 +14,9 @@ SERBOT_TICVLA_VENV_ACTIVATE="$SERBOT_TICVLA_ROOT/venvs/ticvla/bin/activate" # to
 SERBOT_BRIDGE_SCRIPT="$SERBOT_TICVLA_ROOT/scripts/ticvla_bridge.py"
 SERBOT_CMD_VEL_MUX="$SERBOT_TICVLA_ROOT/scripts/cmd_vel_mux.py"
 # mux 전진 속도 상한(m/s). omni_drive_ctrl 경로는 0.10 이 바퀴 명령 ±2 라 실속도 ~0.02 m/s
-# 였다(261029 ReAct 실주행) — 0.20 으로 올림. 조이스틱은 모터를 직접 돌려서 이 값과 무관.
-SERBOT_MUX_MAX_VX="0.20"
+# 였다(261029 ReAct 실주행) — 0.20, 261105 에 0.50 으로 올림(0.20 실측 ~0.08 m/s). 조이스틱은
+# 모터를 직접 돌려서 이 값과 무관. TIC-VLA 브리지 명령도 이 상한을 같이 받는다.
+SERBOT_MUX_MAX_VX="0.50"
 SERBOT_COLLECT_DIR="$SERBOT_TICVLA_ROOT/collect"
 SERBOT_JOYSTICK_ERRAND="$SERBOT_COLLECT_DIR/joystick_errand.py"
 SERBOT_JOYSTICK_GOTOOBJECT="$SERBOT_COLLECT_DIR/joystick_gotoobject.py"
