@@ -50,16 +50,19 @@ You are the eyes of a small indoor mobile robot. Describe what the robot's \
 front camera sees in 2-4 short sentences. Name every distinct object or \
 landmark you can see with a short, specific noun phrase (e.g. "red marker", \
 "blue cooler", "office chair", "open door") and say whether it is on the \
-left, center or right and roughly near or far. If the scene is dark or \
-blurry, say so. Do not speculate about things that are not visible."""
+left, center or right and roughly near or far. For small objects resting on \
+furniture, say what they are on (e.g. "books on a low wooden desk"). If the \
+scene is dark or blurry, say so. Do not speculate about things that are not \
+visible."""
 
 _LOCATE_PROMPT = """\
 Find "{target}" in this image from a robot's front camera.
 Answer with ONLY one JSON object, no markdown:
 {{"visible": true|false, "box_2d": [ymin, xmin, ymax, xmax], "distance_m": <float>}}
 box_2d uses 0-1000 normalized coordinates. distance_m is your rough estimate \
-of the distance from the camera to the target on the floor. If the target is \
-not visible, answer {{"visible": false}}."""
+of the horizontal distance along the floor from the camera to the target (for \
+an object on furniture, to the floor point below it). If the target is not \
+visible, answer {{"visible": false}}."""
 
 _RE_JSON = re.compile(r'\{.*\}', re.DOTALL)
 
@@ -386,6 +389,9 @@ class DirectDriveAdapter(TicVlaAdapter):
         cfg = self._cfg
         total_moved = 0.0
         last_box_h = 0.0
+        # 가구 위 물체(책상 위 책 등)는 한 번 판정되면 이 goto 동안 유지한다 — 다가가면
+        # bbox 아래끝이 수평선 아래로 내려와 바닥 물체 식(더 멀게 봄)으로 바뀌면 부딪힌다.
+        elevated = False
         for it in range(1, cfg.max_servo_iters + 1):
             loc = self._locate(target, f'goto-{target}-{it}')
             if loc is None:
@@ -393,7 +399,7 @@ class DirectDriveAdapter(TicVlaAdapter):
                     f'goto-{target}-lost', '(Scene description unavailable right now.)')
                 if it == 1:
                     prefix = 'The target is not visible from here.'
-                elif last_box_h >= 0.25:
+                elif last_box_h >= 0.25 or (elevated and total_moved > 0.0):
                     # 크게 보이다가 사라지면 화면 밖으로 잘릴 만큼 가까워진 것이다.
                     prefix = (f'Moved {total_moved:.1f} m toward the {target}; it is now so '
                               'close that it no longer fits in the camera view. Do not go '
@@ -405,20 +411,26 @@ class DirectDriveAdapter(TicVlaAdapter):
             cx = (xmin + xmax) / 2.0
             box_h = max(0.0, ymax - ymin)
             last_box_h = box_h
+            if not elevated and ymax < cfg.elevated_ymax:
+                elevated = True
+                self._log.info(f'[goto {target}] 가구 위 물체로 판정(ymax={ymax:.2f}) — '
+                               f'k={cfg.elevated_bbox_dist_k}, 정지 {cfg.elevated_stop_distance_m} m')
+            dist_k = cfg.elevated_bbox_dist_k if elevated else cfg.bbox_dist_k
+            stop_m = cfg.elevated_stop_distance_m if elevated else cfg.stop_distance_m
             llm_dist = float(loc.get('distance_m') or 0.0)
-            bbox_dist = cfg.bbox_dist_k / box_h if box_h > 0.0 else 0.0
+            bbox_dist = dist_k / box_h if box_h > 0.0 else 0.0
             # 둘 중 가까운 쪽(0 은 "모름")
             dist = min((d for d in (llm_dist, bbox_dist) if d > 0.0), default=0.0)
             bearing_deg = (0.5 - cx) * cfg.hfov_deg  # + = 왼쪽(반시계)
             self._log.info(
                 f'[goto {target} #{it}] cx={cx:.2f} box_h={box_h:.2f} '
                 f'dist≈{dist:.2f}m (gemini {llm_dist:.2f}, bbox {bbox_dist:.2f}) '
-                f'bearing={bearing_deg:+.1f}°')
+                f'bearing={bearing_deg:+.1f}°{" [elevated]" if elevated else ""}')
 
             # 박스 아래쪽이 화면 끝에 닿으면 이미 코앞이다 — 더 가면 부딪힌다.
             touching_bottom = ymax >= 0.97
             if (box_h >= cfg.arrive_bbox_h or touching_bottom
-                    or (0.0 < dist <= cfg.stop_distance_m)):
+                    or (0.0 < dist <= stop_m + (0.1 if elevated else 0.0))):
                 if abs(bearing_deg) > cfg.heading_tolerance_deg:
                     self._rotate_by(math.radians(bearing_deg))
                 scene = self._describe_soft(
@@ -428,9 +440,13 @@ class DirectDriveAdapter(TicVlaAdapter):
 
             if abs(bearing_deg) > cfg.heading_tolerance_deg:
                 self._rotate_by(math.radians(bearing_deg))
-            step = cfg.max_step_m if dist <= 0.0 else min(
-                cfg.max_step_m,
-                max(0.1, cfg.step_fraction * (dist - cfg.stop_distance_m)))
+            # 가구 위 물체는 거리 상수가 실측 기반이라 남은 거리를 더 크게(80%) 줄이되,
+            # 한 번에 0.5 m 이하로 끊어 다시 본다. 정지는 stop_m + 0.1 m 안이면 도착.
+            max_step = min(cfg.max_step_m, cfg.elevated_max_step_m) if elevated else cfg.max_step_m
+            fraction = cfg.elevated_step_fraction if elevated else cfg.step_fraction
+            step = max_step if dist <= 0.0 else min(
+                max_step,
+                max(0.1, fraction * (dist - stop_m)))
             self._log.info(f'[goto {target} #{it}] 전진 {step:.2f} m')
             total_moved += self._forward_by(step)
 

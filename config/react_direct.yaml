@@ -18,7 +18,10 @@ limits:
   max_goto_calls: 6
   max_total_steps: 20
 
-fewshot_path: "prompts/react_fewshot.txt"
+# direct 전용 few-shot: 안 보이면 제자리 회전으로 먼저 훑고, 물건이 있을 법한 가구(책상 등)가
+# 보이면 그때 간다. 공용 prompts/react_fewshot.txt 는 "주변 가구로 가서 확인"을 가르쳐
+# 10/29 13:07 판에서 엉뚱한 쪽으로 출발했다.
+fewshot_path: "prompts/react_direct_fewshot.txt"
 log_dir: "logs/react"
 
 direct:
@@ -36,6 +39,11 @@ direct:
   arrive_bbox_h: 0.45
   bbox_dist_k: 0.40                  # bbox 거리 ≈ k / box_h — Gemini 거리와 비교해 가까운 쪽 사용(261029 마커 충돌 직전)
   step_fraction: 0.6                 # 남은 거리의 60% 씩만 전진
+  elevated_ymax: 0.5                 # bbox 아래끝이 수평선(0.5)보다 위면 "가구 위 물체"(책상 위 책)
+  elevated_bbox_dist_k: 0.23         # 가구 위 물체 거리 상수 — 261105 book probe 실측 0.21–0.25 (0.40 이면 1.5배 멀게 봐 책상에 부딪힘)
+  elevated_stop_distance_m: 0.8      # 가구 위 물체는 0.8(+0.1) m 안에서 정지 — 받침 가구 앞면이 목표보다 가깝다
+  elevated_step_fraction: 0.8        # 남은 거리의 80% 씩, 한 번에 최대 0.5 m
+  elevated_max_step_m: 0.5
   heading_tolerance_deg: 6.0
   motion_timeout_sec: 20.0
   frame_save_dir: "logs/react_direct"

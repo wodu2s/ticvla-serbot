@@ -100,6 +100,18 @@ class DirectDriveConfig:
     #: 남은 거리(추정 − stop_distance_m) 중 한 번에 가는 비율. 추정 오차를 다음
     #: 관측에서 다시 보정할 여지를 남긴다.
     step_fraction: float = 0.6
+    #: 목표 bbox 아래끝(ymax)이 이 값보다 위면 "가구 위 물체"(책상 위 책 등)로 보고
+    #: 아래 elevated_* 값을 쓴다. 0.5 = 카메라 수평선(대시보드 빨간 선).
+    elevated_ymax: float = 0.5
+    #: 가구 위 물체용 bbox 거리 상수. 261105 book probe 실측(1.5 m→box_h 0.164,
+    #: 2.0 m→0.114, 0.8 m→≈0.26)에서 0.21–0.25. 0.40 을 쓰면 1.5–1.7배 멀게 봐서
+    #: 첫 전진에 책상 코앞까지 붙고 다음 전진에 부딪힌다.
+    elevated_bbox_dist_k: float = 0.23
+    #: 가구 위 물체는 이 거리(m)에서 멈춘다 — 받침 가구 앞면이 목표보다 가깝다.
+    elevated_stop_distance_m: float = 0.8
+    #: 가구 위 물체 접근 시 남은 거리 중 한 번에 가는 비율과 한 번 전진 상한(m).
+    elevated_step_fraction: float = 0.8
+    elevated_max_step_m: float = 0.5
     #: 방위각이 이 값(도) 이하면 회전 없이 바로 전진한다.
     heading_tolerance_deg: float = 6.0
     #: 동작 하나(회전/전진)의 시간 상한(초). 넘으면 정지하고 실패 처리.

@@ -1,0 +1,71 @@
+Goal: Find the book.
+
+Action: (episode start)
+Observation: White foam panels stand in the center, close. A wooden chair is on the left, near, and beige cabinets are far behind it. No desk or book is visible.
+
+Action: think[No book is visible. Books are usually on a desk, table or shelf, and none of those is in view. The chair and the panels are not places where a book would be, so I should not go to them. I will look around in place first.]
+Observation: OK.
+
+Action: rotate[left]
+Observation: Turned left 45 degrees. A gray wall with a window on the right, far. A gray trash bin is on the left, near the wall. No desk or book is visible.
+
+Action: rotate[left]
+Observation: Turned left 44 degrees. A low wooden desk stands against the wall in the center, far. A tan file tray and a few upright books are on the low wooden desk. A white power outlet is on the wall to the right.
+
+Action: think[I can see upright books on the low wooden desk. The books are visible, so I can drive to them directly.]
+Observation: OK.
+
+Action: goto[upright books]
+Observation: The robot is now directly in front of the upright books. Two upright books and a tan file tray are on a low wooden desk in the center, near.
+
+Action: done[found]
+
+Goal: Find the red cup.
+
+Action: (episode start)
+Observation: A long white wall is in the center. A gray trash bin is on the right, near. No cup is visible.
+
+Action: think[A cup is usually on a desk or table. None is visible, so I will turn in place before going anywhere.]
+Observation: OK.
+
+Action: rotate[right]
+Observation: Turned right 45 degrees. A wooden desk is in the center, far. Some small objects are on the wooden desk but they are too far to tell what they are.
+
+Action: think[The cup could be one of the small objects on the wooden desk. I will go to the desk to see them closer.]
+Observation: OK.
+
+Action: goto[wooden desk]
+Observation: The robot is now directly in front of the wooden desk. A red cup and a stack of papers are on the wooden desk in the center, near.
+
+Action: goto[red cup]
+Observation: The robot is now directly in front of the red cup. A red cup is on the wooden desk in the center, near.
+
+Action: done[found]
+
+Goal: Find the green marker.
+
+Action: (episode start)
+Observation: A white panel wall is in the center, near. Nothing else is visible.
+
+Action: rotate[left]
+Observation: Turned left 45 degrees. A white panel wall continues on the left. A black office chair is on the right, far.
+
+Action: rotate[left]
+Observation: Turned left 45 degrees. Beige cabinets are in the center, far. No marker is visible.
+
+Action: rotate[left]
+Observation: Turned left 44 degrees. An open door is in the center, far.
+
+Action: rotate[left]
+Observation: Turned left 45 degrees. A gray trash bin is on the left, near the wall. No marker is visible.
+
+Action: think[I have turned about 180 degrees and the green marker is still not visible. A marker sits on the floor, so I need to finish looking around before moving to another area.]
+Observation: OK.
+
+Action: rotate[left]
+Observation: Turned left 45 degrees. A green marker is on the floor on the right, far. A white panel is behind it.
+
+Action: goto[green marker]
+Observation: The robot is now directly in front of the green marker. A green marker is on the floor in the center, near.
+
+Action: done[found]
